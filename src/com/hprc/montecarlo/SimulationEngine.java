@@ -24,6 +24,10 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Random;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.stream.Collectors;
 
 /**
@@ -357,6 +361,59 @@ public class SimulationEngine {
             }
         } catch (IOException e) {
             System.err.println("Error writing to CSV file: " + e.getMessage());
+        }
+    }
+
+    public interface SimulationProgressListener {
+        void onProgress(int completed, int total);
+    }
+
+    /**
+     * Runs the provided simulations in parallel using a fixed thread pool.
+     * This executes the OpenRocket simulation in-process (no GUI dialog).
+     *
+     * @param sims     simulations to run
+     * @param threads  number of worker threads (>= 1)
+     * @param listener optional progress callback (may be called from worker threads)
+     */
+    public void runSimulationsInParallel(List<Simulation> sims, int threads, SimulationProgressListener listener) throws Exception {
+        if (sims == null || sims.isEmpty()) return;
+
+        int threadCount = Math.max(1, threads);
+        ExecutorService pool = Executors.newFixedThreadPool(threadCount);
+
+        try {
+            final int total = sims.size();
+            final java.util.concurrent.atomic.AtomicInteger completed = new java.util.concurrent.atomic.AtomicInteger(0);
+
+            List<Future<?>> futures = new ArrayList<>(sims.size());
+            for (Simulation s : sims) {
+                futures.add(pool.submit(() -> {
+                    try {
+                        SimulationRunner.runSimulationInProcess(s);
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    } finally {
+                        int done = completed.incrementAndGet();
+                        if (listener != null) listener.onProgress(done, total);
+                    }
+                }));
+            }
+
+            // Propagate first failure (if any)
+            for (Future<?> f : futures) {
+                try {
+                    f.get();
+                } catch (ExecutionException ex) {
+                    Throwable cause = ex.getCause();
+                    if (cause instanceof RuntimeException re && re.getCause() != null) {
+                        throw (re.getCause() instanceof Exception e) ? e : re;
+                    }
+                    throw ex;
+                }
+            }
+        } finally {
+            pool.shutdownNow();
         }
     }
 }

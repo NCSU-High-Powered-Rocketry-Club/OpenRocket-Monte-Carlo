@@ -54,6 +54,9 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
     private double massStdDevPercent = 0.0;        // %
     private double initialVelocityStdDev = 0.0;    // m/s
 
+    // Batch execution (JVM threads)
+    private int workerThreads = 1;
+
     @Override
     public void initialize(final SimulationConditions conditions) throws SimulationException {
         if (!enabled) return;
@@ -256,6 +259,14 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
 
     public double getInitialVelocityStdDev() { return initialVelocityStdDev; }
     public void setInitialVelocityStdDev(double v) { initialVelocityStdDev = Math.max(0.0, finiteOrZero(v)); fireChangeEvent(); }
+
+    public int getWorkerThreads() {
+        return workerThreads;
+    }
+
+    public void setWorkerThreads(int workerThreads) {
+        this.workerThreads = Math.max(1, workerThreads);
+    }
 
     private static double finiteOrZero(double v) {
         return Double.isFinite(v) ? v : 0.0;

@@ -41,6 +41,7 @@ import java.io.File;
 import java.lang.reflect.Field;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 import javax.swing.*;
 import javax.swing.table.DefaultTableModel;
 
@@ -69,6 +70,8 @@ public class SimulationOptionsFrame extends JFrame {
     private OpenRocketDocument document;
     private File openRocketFile, thrustCurveFile;
     private SimulationEngine simulationEngine;
+
+    private int workerThreads = Math.max(1, Runtime.getRuntime().availableProcessors());
 
     public SimulationOptionsFrame() {
         super("Waterloo Rocketry Monte-Carlo Simulator");
@@ -157,14 +160,27 @@ public class SimulationOptionsFrame extends JFrame {
     }
 
     private @NotNull JPanel getMonteCarloOptionsPanel() {
-        JPanel panel = new JPanel(new MigLayout("fill, ins 20 20 20 20, wrap 2", "[grow]", ""));
+        // FIX: define TWO columns because we use wrap 2 (label + editor)
+        JPanel panel = new JPanel(new MigLayout(
+                "fill, ins 20 20 20 20, wrap 2",
+                "[grow 0]10[grow, fill]",
+                ""
+        ));
         panel.setBorder(BorderFactory.createTitledBorder("Generate Conditions"));
 
-        panel.add(new JLabel("Number of simulations"), "align label, growx");
+        panel.add(new JLabel("Number of simulations"), "align label");
         final JFormattedTextField numSimTextField = getNumSimField();
-        panel.add(numSimTextField);
+        panel.add(numSimTextField, "growx");
 
-        panel.add(new JLabel("Wind direction standard deviation"), "align label, growx");
+        // --- worker thread count ---
+        panel.add(new JLabel("Worker threads"), "align label");
+        int maxThreads = Math.max(1, Runtime.getRuntime().availableProcessors());
+        JSpinner threadsSpinner = new JSpinner(new SpinnerNumberModel(workerThreads, 1, maxThreads, 1));
+        threadsSpinner.setEditor(new SpinnerEditor(threadsSpinner));
+        threadsSpinner.addChangeListener(e -> workerThreads = ((Number) threadsSpinner.getValue()).intValue());
+        panel.add(threadsSpinner, "growx");
+
+        panel.add(new JLabel("Wind direction standard deviation"), "align label");
         DoubleModel windDirStDevModel = new DoubleModel(windDirStdDev, UnitGroup.UNITS_ANGLE, 0);
         JSpinner windDirStDevField = new JSpinner(windDirStDevModel.getSpinnerModel());
         windDirStDevField.setEditor(new SpinnerEditor(windDirStDevField));
@@ -521,21 +537,72 @@ public class SimulationOptionsFrame extends JFrame {
         runButton.addActionListener(e -> {
 
             log.info("Options accepted, starting Monte Carlo Simulation");
-
-            // due to memory limitations, we run simulations in batches and process desired data
-            // this allows us to remove the large OR Simulation object from memory
             log.info("Simulations: {} Batches: {}", simulationEngine.simulationCount, batchCount);
 
+            // If user selected >1 worker threads, run headless + parallel (no SimulationRunDialog)
+            if (workerThreads > 1) {
+                runButton.setEnabled(false);
+
+                final int threadsToUse = workerThreads;
+                SwingWorker<Void, Void> worker = new SwingWorker<>() {
+                    @Override
+                    protected Void doInBackground() throws Exception {
+                        for (int i = 0; i < batchCount; i++) {
+                            int start = i * BATCH_RUN_SIZE;
+                            List<Simulation> sims = simulationEngine.getSimulations(start, BATCH_RUN_SIZE);
+
+                            // Run this batch in parallel
+                            simulationEngine.runSimulationsInParallel(sims, threadsToUse, (completed, total) -> {
+                                // no Swing updates from worker threads here
+                            });
+
+                            // Process data + update UI per-batch
+                            simulationEngine.processSimulationData();
+                            pcs.firePropertyChange(SIMULATIONS_PROCESSED_EVENT, null, i + 1);
+
+                            // Encourage GC between batches (matches your existing behavior)
+                            Runtime.getRuntime().gc();
+                        }
+                        return null;
+                    }
+
+                    @Override
+                    protected void done() {
+                        try {
+                            get(); // rethrow exceptions
+                            pcs.firePropertyChange(SIMULATIONS_DONE_EVENT, null, true);
+                        } catch (Exception ex) {
+                            log.error("Parallel Monte Carlo run failed", ex);
+                            ErrorSet errors = new ErrorSet();
+                            errors.add(ex.toString());
+                            ErrorWarningDialog.showErrorsAndWarnings(
+                                    SimulationOptionsFrame.this,
+                                    "Simulation failed",
+                                    "Parallel Run Error",
+                                    errors,
+                                    new WarningSet()
+                            );
+                            // allow rerun
+                            pcs.firePropertyChange(SIMULATIONS_DONE_EVENT, true, null);
+                        }
+                    }
+                };
+
+                worker.execute();
+                return;
+            }
+
+            // --- Existing single-thread / dialog-driven behavior ---
             for (int i = 0; i < batchCount; i++) {
                 int start = i * BATCH_RUN_SIZE;
                 List<Simulation> sims = simulationEngine.getSimulations(start, BATCH_RUN_SIZE);
                 JDialog runDialog = getSimulationRunDialog(sims, i + 1);
                 runDialog.setVisible(true);
             }
-            simulationEngine.processSimulationData(); // race condition between windowListener and this thread, safe to call again
-            // simulationEngine.summarizeSimulations();
+            simulationEngine.processSimulationData();
             pcs.firePropertyChange(SIMULATIONS_DONE_EVENT, null, true);
         });
+
         runButton.setEnabled(false);
         pcs.addPropertyChangeListener(SIMULATIONS_CONFIGURED_EVENT, event ->
                 runButton.setEnabled(event.getNewValue() != null));

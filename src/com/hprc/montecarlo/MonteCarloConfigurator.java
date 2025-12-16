@@ -123,6 +123,15 @@ public class MonteCarloConfigurator
         panel.add(new JSeparator(), "span 3, growx");
         panel.add(sectionLabel("Batch run / Export"), "span 3, growx");
 
+        // NEW: Worker threads selector (JVM threads)
+        panel.add(new JLabel("Worker threads"), "align label");
+        int maxThreads = Math.max(1, Runtime.getRuntime().availableProcessors());
+        int initialThreads = Math.min(Math.max(1, ext.getWorkerThreads()), maxThreads);
+        JSpinner threadsSpinner = new JSpinner(new SpinnerNumberModel(initialThreads, 1, maxThreads, 1));
+        threadsSpinner.setEditor(new SpinnerEditor(threadsSpinner));
+        threadsSpinner.addChangeListener(e -> ext.setWorkerThreads(((Number) threadsSpinner.getValue()).intValue()));
+        panel.add(threadsSpinner, "span 2, growx");
+
         final JProgressBar progress = new JProgressBar(0, Math.max(1, ext.getNumberOfSimulations()));
         progress.setStringPainted(true);
         progress.setValue(0);
@@ -142,22 +151,33 @@ public class MonteCarloConfigurator
             progress.setValue(0);
             progress.setString("Starting...");
 
+            final int runs = ext.getNumberOfSimulations();
+            final int threads = Math.max(1, ext.getWorkerThreads());
+
             SwingWorker<List<MonteCarloRunRecord>, String> worker = new SwingWorker<>() {
                 @Override
                 protected List<MonteCarloRunRecord> doInBackground() throws Exception {
-                    return MonteCarloBatchRunner.runBatch(
-                            sim,
-                            ext.getNumberOfSimulations(),
-                            (completed, total, msg) -> {
-                                setProgress((int) (100.0 * completed / Math.max(1, total)));
-                                publish(msg + " (" + completed + "/" + total + ")");
-                                // Update actual bar counts on EDT
-                                SwingUtilities.invokeLater(() -> {
+                    if (threads <= 1) {
+                        return MonteCarloBatchRunner.runBatch(
+                                sim,
+                                runs,
+                                (completed, total, msg) -> SwingUtilities.invokeLater(() -> {
                                     progress.setMaximum(total);
                                     progress.setValue(completed);
                                     progress.setString(msg);
-                                });
-                            }
+                                })
+                        );
+                    }
+
+                    return MonteCarloBatchRunner.runBatchParallel(
+                            sim,
+                            runs,
+                            threads,
+                            (completed, total, msg) -> SwingUtilities.invokeLater(() -> {
+                                progress.setMaximum(total);
+                                progress.setValue(completed);
+                                progress.setString(msg);
+                            })
                     );
                 }
 
