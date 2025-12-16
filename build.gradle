@@ -1,0 +1,125 @@
+plugins {
+    id 'java'
+    id 'application'
+    id 'com.github.johnrengelman.shadow' version '7.1.2'
+}
+
+group = 'com.airbrakesplugin'
+version = '1.0-SNAPSHOT'
+
+repositories {
+    mavenCentral()
+    flatDir { dirs 'libs' }
+}
+
+// ---- OpenRocket JAR (local) ----
+def openRocketJarName = 'OpenRocket-24.12.jar'
+def openRocketJarPath = "libs/${openRocketJarName}"
+def openRocketJarFile = file(openRocketJarPath)
+
+tasks.register('verifyOpenRocketJar') {
+    doLast {
+        println "OpenRocket JAR found: ${openRocketJarFile.absolutePath}"
+    }
+}
+tasks.named('compileJava').configure { dependsOn 'verifyOpenRocketJar' }
+
+// ---- Nonstandard source layout ----
+// Your code is under: OR_Monte_Carlo/src/com/hprc/montecarlo (and package names don’t have to match folders)
+sourceSets {
+    main {
+        java {
+            srcDirs = ['src']
+        }
+        resources {
+            // If you later add resources, put them here (optional)
+            srcDirs = ['src/main/resources', 'resources']
+        }
+    }
+    test {
+        java {
+            srcDirs = ['test', 'src/test/java']
+        }
+        resources {
+            srcDirs = ['src/test/resources']
+        }
+    }
+}
+
+// ---- Java 17 only (OpenRocket compatibility) ----
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = 17
+    options.encoding = 'UTF-8'
+}
+
+// ---- App entrypoint (for running Main from Gradle) ----
+application {
+    // matches: package com.waterloorocketry.openrocket_monte_carlo; class Main
+    mainClass = 'src.com.hprc.montecarlo.Main'
+}
+
+// ---- Dependencies ----
+dependencies {
+    // OpenRocket API/classes
+    compileOnly files(openRocketJarPath)
+    testCompileOnly files(openRocketJarPath)
+
+    // Your code uses com.opencsv.CSVParser (NOT Apache Commons CSV)
+    implementation 'com.opencsv:opencsv:5.9'
+
+    // Your code uses MigLayout
+    implementation 'com.miglayout:miglayout-swing:11.4.2'
+
+    // Your code uses Google Guice
+    implementation 'com.google.inject:guice:7.0.0'
+
+    // Used by your Statistics/Math needs
+    implementation 'org.apache.commons:commons-math3:3.6.1'
+
+    // JetBrains annotations (@NotNull)
+    compileOnly 'org.jetbrains:annotations:24.1.0'
+    testCompileOnly 'org.jetbrains:annotations:24.1.0'
+
+    // Logging (handy for running from Gradle; OpenRocket may provide logging when run as a plugin)
+    implementation 'org.slf4j:slf4j-api:2.0.16'
+    runtimeOnly 'org.slf4j:slf4j-simple:2.0.16'
+
+    // Tests
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
+    testImplementation 'org.mockito:mockito-core:5.13.0'
+    testImplementation 'org.mockito:mockito-junit-jupiter:5.13.0'
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+}
+
+// ---- Jars ----
+// Thin plugin jar (recommended for OpenRocket plugins)
+jar {
+    archiveBaseName.set('AirbrakePlugin')
+    archiveClassifier.set('')
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+// Shadow jar (useful for standalone debugging; generally NOT what you drop into OpenRocket)
+shadowJar {
+    archiveBaseName.set('AirbrakePlugin')
+    archiveClassifier.set('all')
+    // Keep OpenRocket out of the fat jar (it’s compileOnly anyway, but this makes intent explicit)
+    dependencies {
+        exclude { dep ->
+            dep.moduleGroup?.toLowerCase()?.contains('openrocket') == true
+        }
+    }
+}
+
+// Convenience task names
+tasks.register('pluginJar') { dependsOn 'jar' }
+tasks.register('debugJar') { dependsOn 'shadowJar' }
