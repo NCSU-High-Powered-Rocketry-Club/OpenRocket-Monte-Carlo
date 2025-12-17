@@ -41,7 +41,9 @@ public final class MonteCarloBatchRunner {
             int runIndex = i + 1;
             if (cb != null) cb.onProgress(i, runs, "Preparing run " + runIndex + " / " + runs);
 
-            Simulation s = new Simulation(doc, rocket);
+            // CLONE the rocket to ensure mass variations don't accumulate or affect the document
+            Rocket rocketCopy = (Rocket) rocket.copy();
+            Simulation s = new Simulation(doc, rocketCopy);
             s.setName(baseSimulation.getName() + " MC " + runIndex);
 
             // Copy base options
@@ -127,7 +129,9 @@ public final class MonteCarloBatchRunner {
 
                 futures.add(pool.submit(() -> {
                     // Build an independent Simulation instance for this run
-                    Simulation s = new Simulation(doc, rocket);
+                    // CLONE the rocket here as well
+                    Rocket rocketCopy = (Rocket) rocket.copy();
+                    Simulation s = new Simulation(doc, rocketCopy);
                     s.setName(baseSimulation.getName() + " MC " + runIndex);
 
                     // Copy base options

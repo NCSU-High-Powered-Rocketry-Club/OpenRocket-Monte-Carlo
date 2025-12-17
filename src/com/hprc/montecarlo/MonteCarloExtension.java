@@ -5,6 +5,11 @@ import info.openrocket.core.simulation.SimulationOptions;
 import info.openrocket.core.simulation.SimulationConditions;
 import info.openrocket.core.simulation.exception.SimulationException;
 import info.openrocket.core.simulation.extension.AbstractSimulationExtension;
+import info.openrocket.core.rocketcomponent.Rocket;
+import info.openrocket.core.rocketcomponent.RocketComponent;
+import info.openrocket.core.simulation.SimulationStatus;
+import info.openrocket.core.simulation.listeners.AbstractSimulationListener;
+import info.openrocket.core.util.Coordinate;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -130,20 +135,67 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
             opts.setLaunchPressure(variedPa);
         }
 
-        // --- Items that may not be directly supported by SimulationOptions ---
-        // Try to set initial velocity if such a method exists (API differs by OR version).
+        // --- Initial Velocity (via SimulationListener) ---
         if (initialVelocityStdDev > 0) {
-            tryInvokeSetter(opts, "setInitialVelocity", opts.getClass(), (double) (rng.nextGaussian() * initialVelocityStdDev));
+            // We cannot set this on SimulationOptions easily. 
+            // Instead, we attach a listener to inject velocity at t=0.
+            double addedVelocity = Math.abs(rng.nextGaussian() * initialVelocityStdDev);
+            
+            conditions.getSimulationListenerList().add(new AbstractSimulationListener() {
+                @Override
+                public void startSimulation(SimulationStatus status) {
+                    try {
+                        // Get current velocity (usually 0,0,0)
+                        Coordinate current = status.getRocketVelocity();
+                        
+                        // Assuming we want to add velocity in the Z (up) direction 
+                        // or simply set the magnitude if it's a rail launch.
+                        // For simplicity, we add to Z (altitude axis in simulation frame usually).
+                        // A more complex implementation would project this along the launch rod vector.
+                        Coordinate newVel = current.add(new Coordinate(0, 0, addedVelocity));
+                        
+                        status.setRocketVelocity(newVel);
+                        
+                        if (debugEnabled) {
+                            log.debug("MC applied: injected initial velocity {} m/s", addedVelocity);
+                        }
+                    } catch (Exception e) {
+                        log.warn("Failed to inject initial velocity", e);
+                    }
+                }
+            });
         }
 
-        // Mass variation often requires changing the Rocket/Component masses, not just SimulationOptions.
-        // Store the value for now (GUI works); implementing this safely depends on OpenRocket's component API.
-        if (debugEnabled) {
-            log.debug("MC applied: railAngleStdDevDeg={}, railDirStdDevDeg={}, windSpeedStdDev={}, windDirStdDevDeg={}, tempStdDevC={}, pressureStdDevMbar={}, massStdDevPercent={}, initVelStdDev={}",
-                    launchRodAngleStdDevDeg, launchRodDirectionStdDevDeg,
-                    windSpeedStdDev, windDirectionStdDevDeg,
-                    temperatureStdDevC, pressureStdDevMbar,
-                    massStdDevPercent, initialVelocityStdDev);
+        // --- Mass Variation ---
+        if (massStdDevPercent > 0) {
+            // Calculate a global multiplier (e.g. 1.05 for +5%)
+            double factor = 1.0 + (rng.nextGaussian() * (massStdDevPercent / 100.0));
+            
+            // Apply to the rocket components
+            Rocket rocket = conditions.getRocket();
+            applyMassMultiplier(rocket, factor);
+            
+            if (debugEnabled) {
+                log.debug("MC applied: mass factor {}", factor);
+            }
+        }
+    }
+
+    /**
+     * Recursively scales the mass of the component and all its children.
+     */
+    private void applyMassMultiplier(RocketComponent component, double factor) {
+        // getComponentMass() returns the mass of THIS component (including material), excluding children.
+        double originalMass = component.getComponentMass();
+        
+        // We set an override. This overrides the material calculation for this specific simulation instance.
+        // Since we cloned the rocket in the runner, this is safe.
+        if (originalMass > 0) {
+            component.setOverrideMass(originalMass * factor);
+        }
+
+        for (RocketComponent child : component.getChildren()) {
+            applyMassMultiplier(child, factor);
         }
     }
 

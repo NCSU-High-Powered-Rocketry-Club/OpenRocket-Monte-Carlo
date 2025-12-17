@@ -29,6 +29,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.stream.Collectors;
+import info.openrocket.core.rocketcomponent.Rocket;
 
 /**
  * The main class that is run
@@ -179,7 +180,9 @@ public class SimulationEngine {
     public void createMonteCarloSimulations(Simulation referenceSim) {
         data.clear();
         for (int i = 0; i < simulationCount; i++) {
-            Simulation sim = new Simulation(document, document.getRocket());
+            // CLONE the rocket so MonteCarloExtension can safely modify mass
+            Rocket rocketCopy = (Rocket) document.getRocket().copy();
+            Simulation sim = new Simulation(document, rocketCopy);
             sim.setName("Simulation " + i);
             log.info("Generating conditions for {}", sim.getName());
 
