@@ -26,6 +26,9 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
 
     private static final Logger log = LoggerFactory.getLogger(MonteCarloExtension.class);
 
+    private static final double DEFAULT_T0_K = 288.15;
+    private static final double DEFAULT_P0_PA = 101325.0;
+
     // -------------------------------------------------------------------------
     // UI / stored properties (saved in the .ork file)
     // -------------------------------------------------------------------------
@@ -68,6 +71,11 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
 
         SimulationOptions opts = resolveOptions(conditions);
         Random rng = useDeterministicSeed ? new Random(randomSeed) : new Random();
+
+        // FIX: if user wants manual pressure/temp variation, ensure ISA is disabled so OR uses these fields.
+        if ((temperatureStdDevC > 0.0 || pressureStdDevMbar > 0.0) && opts.isISAAtmosphere()) {
+            opts.setISAAtmosphere(false);
+        }
 
         // --- Launch rod angle/direction (stored internally in radians in OR) ---
         if (launchRodAngleStdDevDeg > 0) {
@@ -124,14 +132,22 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
         // --- Temperature/pressure at launch ---
         if (temperatureStdDevC > 0) {
             double baseK = opts.getLaunchTemperature();
-            double variedK = baseK + rng.nextGaussian() * temperatureStdDevC; // delta C == delta K
+            if (!Double.isFinite(baseK) || baseK <= 0.0) baseK = DEFAULT_T0_K;
+
+            double variedK = baseK + rng.nextGaussian() * temperatureStdDevC;
+            if (!Double.isFinite(variedK) || variedK <= 0.0) variedK = DEFAULT_T0_K;
+
             opts.setLaunchTemperature(variedK);
         }
 
         if (pressureStdDevMbar > 0) {
             double basePa = opts.getLaunchPressure();
+            if (!Double.isFinite(basePa) || basePa <= 0.0) basePa = DEFAULT_P0_PA;
+
             double sigmaPa = pressureStdDevMbar * 100.0;
-            double variedPa = Math.max(0.0, basePa + rng.nextGaussian() * sigmaPa);
+            double variedPa = basePa + rng.nextGaussian() * sigmaPa;
+            if (!Double.isFinite(variedPa) || variedPa <= 0.0) variedPa = DEFAULT_P0_PA;
+
             opts.setLaunchPressure(variedPa);
         }
 
@@ -167,18 +183,54 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
         }
 
         // --- Mass Variation ---
+        // IMPORTANT: always clear existing mass overrides first.
+        // OpenRocket may reuse the same Rocket instance between runs; overrides can persist.
+        Rocket rocket = conditions.getRocket();
+        clearMassOverridesRecursive(rocket);
+
         if (massStdDevPercent > 0) {
-            // Calculate a global multiplier (e.g. 1.05 for +5%)
-            double factor = 1.0 + (rng.nextGaussian() * (massStdDevPercent / 100.0));
-            
-            // Apply to the rocket components
-            Rocket rocket = conditions.getRocket();
+            // Interpret as RELATIVE stddev in percent (e.g. 5% => r = 0.05)
+            double r = massStdDevPercent / 100.0;
+
+            // Use log-normal so multiplier is always > 0 and matches relative stddev.
+            double factor = drawLogNormalMultiplierMeanOne(r, rng);
+
+            // Optional safety clamp to avoid absurd outliers
+            factor = clamp(factor, 0.1, 10.0);
+
             applyMassMultiplier(rocket, factor);
-            
+
             if (debugEnabled) {
-                log.debug("MC applied: mass factor {}", factor);
+                log.debug("MC applied: mass σ={}%, multiplier={}", massStdDevPercent, factor);
+            }
+        } else {
+            if (debugEnabled) {
+                log.debug("MC applied: mass σ=0%, cleared any previous mass overrides");
             }
         }
+    }
+
+    /**
+     * Draws a strictly-positive multiplicative factor with mean 1 and relative stddev = r.
+     *
+     * For r = 0, returns exactly 1.
+     */
+    private static double drawLogNormalMultiplierMeanOne(double r, Random rng) {
+        if (!(r > 0.0) || !Double.isFinite(r)) {
+            return 1.0;
+        }
+
+        // s^2 = ln(1 + r^2), mu = -s^2/2 ensures mean = 1
+        double s2 = Math.log1p(r * r);
+        double s = Math.sqrt(s2);
+        double mu = -0.5 * s2;
+
+        double z = rng.nextGaussian();
+        double factor = Math.exp(mu + s * z);
+
+        // ultra-defensive guard
+        if (!Double.isFinite(factor) || factor <= 0.0) return 1.0;
+        return factor;
     }
 
     /**
@@ -187,15 +239,47 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
     private void applyMassMultiplier(RocketComponent component, double factor) {
         // getComponentMass() returns the mass of THIS component (including material), excluding children.
         double originalMass = component.getComponentMass();
-        
-        // We set an override. This overrides the material calculation for this specific simulation instance.
-        // Since we cloned the rocket in the runner, this is safe.
-        if (originalMass > 0) {
+        if (originalMass > 0 && Double.isFinite(originalMass) && Double.isFinite(factor) && factor > 0) {
             component.setOverrideMass(originalMass * factor);
+            // Some OR versions have an explicit toggle; enable if available.
+            tryInvokeBooleanSetter(component, "setMassOverridden", true);
         }
 
         for (RocketComponent child : component.getChildren()) {
             applyMassMultiplier(child, factor);
+        }
+    }
+
+    /**
+     * Clears any per-component mass override so a σ=0 run truly uses the base rocket mass.
+     * Uses reflection to tolerate OpenRocket API differences.
+     */
+    private static void clearMassOverridesRecursive(RocketComponent component) {
+        if (component == null) return;
+
+        // Newer OR: clearOverrideMass()
+        try {
+            Method m = component.getClass().getMethod("clearOverrideMass");
+            m.invoke(component);
+        } catch (Exception ignored) {
+            // Older OR: setMassOverridden(false) (or similar)
+            tryInvokeBooleanSetter(component, "setMassOverridden", false);
+
+            // Another variant seen in forks: setOverrideMassEnabled(false)
+            tryInvokeBooleanSetter(component, "setOverrideMassEnabled", false);
+        }
+
+        for (RocketComponent child : component.getChildren()) {
+            clearMassOverridesRecursive(child);
+        }
+    }
+
+    private static void tryInvokeBooleanSetter(Object target, String methodName, boolean value) {
+        try {
+            Method m = target.getClass().getMethod(methodName, boolean.class);
+            m.invoke(target, value);
+        } catch (Exception ignored) {
+            // method may not exist in this OR version
         }
     }
 

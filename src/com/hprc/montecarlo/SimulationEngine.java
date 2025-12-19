@@ -60,6 +60,9 @@ public class SimulationEngine {
 
     private double windDirStdDev, tempStdDev, pressureStdDev;
 
+    private static final double DEFAULT_T0_K = 288.15;      // 15 C
+    private static final double DEFAULT_P0_PA = 101325.0;   // sea-level standard
+
     /**
      * Creates a SimulationEngine with simulations specified by the given csvFile
      *
@@ -171,6 +174,30 @@ public class SimulationEngine {
     }
 
     /**
+     * If ISA atmosphere is disabled, OpenRocket expects launch temp/pressure to be valid.
+     * Many of your CSV runs show pressure=0 mbar, which produces non-physical flight behavior.
+     */
+    private static void ensureManualAtmosphereHasValues(SimulationOptions opts) {
+        if (opts == null) return;
+
+        if (!opts.isISAAtmosphere()) {
+            double t = opts.getLaunchTemperature();
+            double p = opts.getLaunchPressure();
+
+            if (!finite(t) || t <= 0.0) {
+                opts.setLaunchTemperature(DEFAULT_T0_K);
+            }
+            if (!finite(p) || p <= 0.0) {
+                opts.setLaunchPressure(DEFAULT_P0_PA);
+            }
+        }
+    }
+
+    private static boolean finite(double value) {
+        return Double.isFinite(value);
+    }
+
+    /**
      * Creates simulations with randomized conditions based on referenceSim and provided values at construct time
      *
      * @param referenceSim Reference simulation to copy base conditions, extensions from
@@ -193,6 +220,9 @@ public class SimulationEngine {
                 sim.getSimulationExtensions().add(c.clone());
             }
 
+            // FIX: if ISA is off, make sure pressure/temp are valid before perturbing.
+            ensureManualAtmosphereHasValues(sim.getOptions());
+
             configureMonteCarloSimulationOptions(sim.getOptions());
             data.add(new SimulationData(sim));
         }
@@ -210,18 +240,29 @@ public class SimulationEngine {
             windLevel.setSpeed(windSpeed);
             log.debug("Cond @ {}: Avg WindSpeed: {}m/s", windLevel.getAltitude(), windSpeed);
 
-            double windDirection = randomGauss(windLevel.getDirection(), windDirStdDev);
-            windLevel.setDirection(Math.toRadians(windDirection));
-            log.debug("Cond @ {}: windDirection: {}degrees", windLevel.getAltitude(), windDirection);
+            // FIX: direction is already radians; windDirStdDev is radians.
+            double windDirectionRad = randomGauss(windLevel.getDirection(), windDirStdDev);
+            windLevel.setDirection(wrapRadians(windDirectionRad));
+            log.debug("Cond @ {}: windDirection: {} rad", windLevel.getAltitude(), windDirectionRad);
         }
 
+        // FIX: keep manual atmosphere values physical when ISA is off.
+        // (delta C == delta K, so σ in C is fine as σ in K)
         double temperature = randomGauss(opts.getLaunchTemperature(), tempStdDev);
+        if (!Double.isFinite(temperature) || temperature <= 0.0) temperature = DEFAULT_T0_K;
         opts.setLaunchTemperature(temperature);
-        log.debug("Cond: Temperature: {}K", temperature);
 
         double pressure = randomGauss(opts.getLaunchPressure(), pressureStdDev);
+        if (!Double.isFinite(pressure) || pressure <= 0.0) pressure = DEFAULT_P0_PA;
         opts.setLaunchPressure(pressure);
-        log.debug("Cond: Pressure: {}Pa", pressure);
+    }
+
+    private static double wrapRadians(double a) {
+        // wrap to [-pi, pi)
+        double x = a;
+        while (x >= Math.PI) x -= 2.0 * Math.PI;
+        while (x < -Math.PI) x += 2.0 * Math.PI;
+        return x;
     }
 
     /**
@@ -240,7 +281,10 @@ public class SimulationEngine {
         opts.setLaunchLongitude(config.getLaunchLongitude());
         opts.setLaunchAltitude(config.getLaunchAltitude());
 
+        // Keep your intended behavior (ISA off), but ensure manual values are not left at 0.
         opts.setISAAtmosphere(false);
+        ensureManualAtmosphereHasValues(opts);
+
         opts.setWindModelType(WindModelType.MULTI_LEVEL);
         opts.getMultiLevelWindModel().clearLevels();
 
