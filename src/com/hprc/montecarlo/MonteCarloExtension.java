@@ -225,15 +225,6 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
         throw new SimulationException("Cannot resolve SimulationOptions from SimulationConditions in this OpenRocket version.");
     }
 
-    private static void tryInvokeSetter(Object target, String methodName, Class<?> ignored, double value) {
-        try {
-            Method m = target.getClass().getMethod(methodName, double.class);
-            m.invoke(target, value);
-        } catch (Exception ignored2) {
-            // intentionally silent: method may not exist in this OR version
-        }
-    }
-
     private static double clamp(double v, double lo, double hi) {
         return Math.max(lo, Math.min(hi, v));
     }
