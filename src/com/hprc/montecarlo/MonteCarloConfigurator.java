@@ -71,19 +71,23 @@ public class MonteCarloConfigurator
         panel.add(sectionLabel("Launch / Orientation variation"), "span 3, growx");
 
         addAngleStdDev(panel, "Launch rail angle σ", UnitGroup.UNITS_ANGLE,
-                ext.getLaunchRodAngleStdDevDeg(), ext::setLaunchRodAngleStdDevDeg);
+                Math.toRadians(ext.getLaunchRodAngleStdDevDeg()),
+                v -> ext.setLaunchRodAngleStdDevDeg(Math.toDegrees(v)));
 
         addAngleStdDev(panel, "Launch rail direction σ", UnitGroup.UNITS_ANGLE,
-                ext.getLaunchRodDirectionStdDevDeg(), ext::setLaunchRodDirectionStdDevDeg);
+                Math.toRadians(ext.getLaunchRodDirectionStdDevDeg()),
+                v -> ext.setLaunchRodDirectionStdDevDeg(Math.toDegrees(v)));
 
         addLengthStdDev(panel, "Launch altitude σ",
                 ext.getLaunchAltitudeStdDevM(), ext::setLaunchAltitudeStdDevM);
 
         addAngleStdDev(panel, "Launch latitude σ", UnitGroup.UNITS_ANGLE,
-                ext.getLaunchLatitudeStdDevDeg(), ext::setLaunchLatitudeStdDevDeg);
+                Math.toRadians(ext.getLaunchLatitudeStdDevDeg()),
+                v -> ext.setLaunchLatitudeStdDevDeg(Math.toDegrees(v)));
 
         addAngleStdDev(panel, "Launch longitude σ", UnitGroup.UNITS_ANGLE,
-                ext.getLaunchLongitudeStdDevDeg(), ext::setLaunchLongitudeStdDevDeg);
+                Math.toRadians(ext.getLaunchLongitudeStdDevDeg()),
+                v -> ext.setLaunchLongitudeStdDevDeg(Math.toDegrees(v)));
 
         panel.add(new JSeparator(), "span 3, growx");
 
@@ -93,7 +97,8 @@ public class MonteCarloConfigurator
                 ext.getWindSpeedStdDev(), ext::setWindSpeedStdDev);
 
         addAngleStdDev(panel, "Wind direction σ", UnitGroup.UNITS_ANGLE,
-                ext.getWindDirectionStdDevDeg(), ext::setWindDirectionStdDevDeg);
+                Math.toRadians(ext.getWindDirectionStdDevDeg()),
+                v -> ext.setWindDirectionStdDevDeg(Math.toDegrees(v)));
 
         addTemperatureStdDev(panel, "Temperature σ",
                 ext.getTemperatureStdDevC(), ext::setTemperatureStdDevC);

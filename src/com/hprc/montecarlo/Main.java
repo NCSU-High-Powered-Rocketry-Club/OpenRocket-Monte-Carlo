@@ -19,9 +19,9 @@ public class Main {
     public static void main(String[] args) throws Exception {
 
         initializeOpenRocket();
-        SimulationOptionsFrame frame = new SimulationOptionsFrame();
+        // SimulationOptionsFrame frame = new SimulationOptionsFrame();
 
-        frame.setVisible(true);
+        // frame.setVisible(true);
 
     }
 
