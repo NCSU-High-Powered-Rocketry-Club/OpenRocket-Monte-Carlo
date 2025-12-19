@@ -29,42 +29,6 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
     private static final double DEFAULT_T0_K = 288.15;
     private static final double DEFAULT_P0_PA = 101325.0;
 
-    // -------------------------------------------------------------------------
-    // UI / stored properties (saved in the .ork file)
-    // -------------------------------------------------------------------------
-
-    private boolean enabled = true;
-    private boolean debugEnabled = false;
-
-    // Monte Carlo run controls (batch count is for future batch-run UX inside OR)
-    private int numberOfSimulations = 100;
-
-    // Reproducibility
-    private boolean useDeterministicSeed = false;
-    private long randomSeed = 1L;
-
-    // Launch / orientation variation
-    private double launchRodAngleStdDevDeg = 0.0;      // rail angle (pitch)
-    private double launchRodDirectionStdDevDeg = 0.0;  // rail direction (heading)
-
-    // Launch coordinates variation
-    private double launchLatitudeStdDevDeg = 0.0;
-    private double launchLongitudeStdDevDeg = 0.0;
-    private double launchAltitudeStdDevM = 0.0;
-
-    // Atmosphere / wind variation
-    private double windSpeedStdDev = 0.0;          // m/s (UnitSelector can display mph etc)
-    private double windDirectionStdDevDeg = 0.0;   // degrees
-    private double temperatureStdDevC = 0.0;       // degC (delta == delta K)
-    private double pressureStdDevMbar = 0.0;       // mbar (1 mbar = 100 Pa)
-
-    // Vehicle / initial state (may require deeper hooks depending on OR API)
-    private double massStdDevPercent = 0.0;        // %
-    private double initialVelocityStdDev = 0.0;    // m/s
-
-    // Batch execution (JVM threads)
-    private int workerThreads = 1;
-
     @Override
     public void initialize(final SimulationConditions conditions) throws SimulationException {
         if (!enabled) return;

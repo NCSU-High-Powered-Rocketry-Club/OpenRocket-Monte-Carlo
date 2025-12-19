@@ -63,6 +63,30 @@ public class SimulationEngine {
     private static final double DEFAULT_T0_K = 288.15;      // 15 C
     private static final double DEFAULT_P0_PA = 101325.0;   // sea-level standard
 
+    private static boolean finite(double v) {
+        return Double.isFinite(v);
+    }
+
+    /**
+     * If ISA atmosphere is disabled, OpenRocket expects launch temp/pressure to be valid.
+     * Many of your CSV runs show pressure=0 mbar, which produces non-physical flight behavior.
+     */
+    private static void ensureManualAtmosphereHasValues(SimulationOptions opts) {
+        if (opts == null) return;
+
+        if (!opts.isISAAtmosphere()) {
+            double t = opts.getLaunchTemperature();
+            double p = opts.getLaunchPressure();
+
+            if (!finite(t) || t <= 0.0) {
+                opts.setLaunchTemperature(DEFAULT_T0_K);
+            }
+            if (!finite(p) || p <= 0.0) {
+                opts.setLaunchPressure(DEFAULT_P0_PA);
+            }
+        }
+    }
+
     /**
      * Creates a SimulationEngine with simulations specified by the given csvFile
      *
@@ -171,30 +195,6 @@ public class SimulationEngine {
      */
     private static double randomGauss(double mu, double sigma) {
         return SimulationEngine.random.nextGaussian() * sigma + mu;
-    }
-
-    /**
-     * If ISA atmosphere is disabled, OpenRocket expects launch temp/pressure to be valid.
-     * Many of your CSV runs show pressure=0 mbar, which produces non-physical flight behavior.
-     */
-    private static void ensureManualAtmosphereHasValues(SimulationOptions opts) {
-        if (opts == null) return;
-
-        if (!opts.isISAAtmosphere()) {
-            double t = opts.getLaunchTemperature();
-            double p = opts.getLaunchPressure();
-
-            if (!finite(t) || t <= 0.0) {
-                opts.setLaunchTemperature(DEFAULT_T0_K);
-            }
-            if (!finite(p) || p <= 0.0) {
-                opts.setLaunchPressure(DEFAULT_P0_PA);
-            }
-        }
-    }
-
-    private static boolean finite(double value) {
-        return Double.isFinite(value);
     }
 
     /**
