@@ -29,6 +29,42 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
     private static final double DEFAULT_T0_K = 288.15;
     private static final double DEFAULT_P0_PA = 101325.0;
 
+    // -------------------------------------------------------------------------
+    // UI / stored properties (saved in the .ork file)
+    // -------------------------------------------------------------------------
+
+    private boolean enabled = true;
+    private boolean debugEnabled = false;
+
+    // Monte Carlo run controls (batch count is for future batch-run UX inside OR)
+    private int numberOfSimulations = 100;
+
+    // Reproducibility
+    private boolean useDeterministicSeed = false;
+    private long randomSeed = 1L;
+
+    // Launch / orientation variation
+    private double launchRodAngleStdDevDeg = 0.0;      // rail angle (pitch)
+    private double launchRodDirectionStdDevDeg = 0.0;  // rail direction (heading)
+
+    // Launch coordinates variation
+    private double launchLatitudeStdDevDeg = 0.0;
+    private double launchLongitudeStdDevDeg = 0.0;
+    private double launchAltitudeStdDevM = 0.0;
+
+    // Atmosphere / wind variation
+    private double windSpeedStdDev = 0.0;          // m/s (UnitSelector can display mph etc)
+    private double windDirectionStdDevDeg = 0.0;   // degrees
+    private double temperatureStdDevC = 0.0;       // degC (delta == delta K)
+    private double pressureStdDevMbar = 0.0;       // mbar (1 mbar = 100 Pa)
+
+    // Vehicle / initial state (may require deeper hooks depending on OR API)
+    private double massStdDevPercent = 0.0;        // %
+    private double initialVelocityStdDev = 0.0;    // m/s
+
+    // Batch execution (JVM threads)
+    private int workerThreads = 1;
+
     @Override
     public void initialize(final SimulationConditions conditions) throws SimulationException {
         if (!enabled) return;
@@ -36,9 +72,20 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
         SimulationOptions opts = resolveOptions(conditions);
         Random rng = useDeterministicSeed ? new Random(randomSeed) : new Random();
 
-        // FIX: if user wants manual pressure/temp variation, ensure ISA is disabled so OR uses these fields.
+        // If user wants manual pressure/temp variation, ensure ISA is disabled AND manual fields are valid.
         if ((temperatureStdDevC > 0.0 || pressureStdDevMbar > 0.0) && opts.isISAAtmosphere()) {
             opts.setISAAtmosphere(false);
+        }
+        if (!opts.isISAAtmosphere()) {
+            // Ensure physical defaults if missing/zero
+            double t = opts.getLaunchTemperature();
+            if (!Double.isFinite(t) || t <= 0.0) {
+                opts.setLaunchTemperature(DEFAULT_T0_K);
+            }
+            double p = opts.getLaunchPressure();
+            if (!Double.isFinite(p) || p <= 0.0) {
+                opts.setLaunchPressure(DEFAULT_P0_PA);
+            }
         }
 
         // --- Launch rod angle/direction (stored internally in radians in OR) ---
@@ -117,27 +164,22 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
 
         // --- Initial Velocity (via SimulationListener) ---
         if (initialVelocityStdDev > 0) {
-            // We cannot set this on SimulationOptions easily. 
-            // Instead, we attach a listener to inject velocity at t=0.
-            double addedVelocity = Math.abs(rng.nextGaussian() * initialVelocityStdDev);
-            
+            // Draw from N(0, sigma) to preserve the requested standard deviation
+            final double injectedVelocity = rng.nextGaussian() * initialVelocityStdDev;
+
             conditions.getSimulationListenerList().add(new AbstractSimulationListener() {
                 @Override
                 public void startSimulation(SimulationStatus status) {
                     try {
-                        // Get current velocity (usually 0,0,0)
                         Coordinate current = status.getRocketVelocity();
-                        
-                        // Assuming we want to add velocity in the Z (up) direction 
-                        // or simply set the magnitude if it's a rail launch.
-                        // For simplicity, we add to Z (altitude axis in simulation frame usually).
-                        // A more complex implementation would project this along the launch rod vector.
-                        Coordinate newVel = current.add(new Coordinate(0, 0, addedVelocity));
-                        
+
+                        // Add along +Z; if you later want rod-aligned, project accordingly.
+                        Coordinate newVel = current.add(new Coordinate(0, 0, injectedVelocity));
+
                         status.setRocketVelocity(newVel);
-                        
+
                         if (debugEnabled) {
-                            log.debug("MC applied: injected initial velocity {} m/s", addedVelocity);
+                            log.debug("MC applied: injected initial velocity {} m/s", injectedVelocity);
                         }
                     } catch (Exception e) {
                         log.warn("Failed to inject initial velocity", e);
@@ -153,14 +195,11 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
         clearMassOverridesRecursive(rocket);
 
         if (massStdDevPercent > 0) {
-            // Interpret as RELATIVE stddev in percent (e.g. 5% => r = 0.05)
             double r = massStdDevPercent / 100.0;
 
-            // Use log-normal so multiplier is always > 0 and matches relative stddev.
-            double factor = drawLogNormalMultiplierMeanOne(r, rng);
-
-            // Optional safety clamp to avoid absurd outliers
-            factor = clamp(factor, 0.1, 10.0);
+            // Mean=1, stddev=r (relative). Clamp only to keep physical (>0).
+            double factor = 1.0 + rng.nextGaussian() * r;
+            factor = clamp(factor, 1e-6, 100.0);
 
             applyMassMultiplier(rocket, factor);
 

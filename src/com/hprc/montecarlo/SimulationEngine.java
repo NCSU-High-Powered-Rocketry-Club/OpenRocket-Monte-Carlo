@@ -58,7 +58,7 @@ public class SimulationEngine {
     private final OpenRocketDocument document;
     private final List<SimulationData> data = new ArrayList<>();
 
-    private double windDirStdDev, tempStdDev, pressureStdDev;
+    private double windDirStdDevRad, tempStdDev, pressureStdDev;
 
     private static final double DEFAULT_T0_K = 288.15;      // 15 C
     private static final double DEFAULT_P0_PA = 101325.0;   // sea-level standard
@@ -162,10 +162,11 @@ public class SimulationEngine {
      * @see SimulationEngine#createMonteCarloSimulations(Simulation)
      */
     SimulationEngine(OpenRocketDocument document, int simulationCount,
-                     double windDirStdDev, double tempStdDev, double pressureStdDev) {
+                     double windDirStdDevDeg, double tempStdDev, double pressureStdDev) {
         this.document = document;
         this.simulationCount = simulationCount;
-        this.windDirStdDev = windDirStdDev;
+        // store as radians to match internal direction units
+        this.windDirStdDevRad = Math.toRadians(windDirStdDevDeg);
         this.tempStdDev = tempStdDev;
         this.pressureStdDev = pressureStdDev;
     }
@@ -241,7 +242,7 @@ public class SimulationEngine {
             log.debug("Cond @ {}: Avg WindSpeed: {}m/s", windLevel.getAltitude(), windSpeed);
 
             // FIX: direction is already radians; windDirStdDev is radians.
-            double windDirectionRad = randomGauss(windLevel.getDirection(), windDirStdDev);
+            double windDirectionRad = randomGauss(windLevel.getDirection(), windDirStdDevRad);
             windLevel.setDirection(wrapRadians(windDirectionRad));
             log.debug("Cond @ {}: windDirection: {} rad", windLevel.getAltitude(), windDirectionRad);
         }

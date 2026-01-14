@@ -99,7 +99,7 @@ public class MonteCarloConfigurator
         addAngleStdDev(panel, "Wind direction σ", UnitGroup.UNITS_ANGLE,
                 Math.toRadians(ext.getWindDirectionStdDevDeg()),
                 v -> ext.setWindDirectionStdDevDeg(Math.toDegrees(v)));
-
+                
         addTemperatureStdDev(panel, "Temperature σ",
                 ext.getTemperatureStdDevC(), ext::setTemperatureStdDevC);
 
