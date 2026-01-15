@@ -96,6 +96,32 @@ public class MonteCarloConfigurator
         addVelocityStdDev(panel, "Wind speed σ",
                 ext.getWindSpeedStdDev(), ext::setWindSpeedStdDev);
 
+        // NEW: optional average wind speed override
+        JCheckBox useAvgWind = new JCheckBox("Use average wind speed", ext.isUseAverageWindSpeed());
+        panel.add(useAvgWind, "span 3, wrap");
+
+        panel.add(new JLabel("Average wind speed"), "align label");
+        DoubleModel avgWindModel = new DoubleModel(ext.getAverageWindSpeedMps(), UnitGroup.UNITS_VELOCITY, 0);
+        JSpinner avgWindSpinner = new JSpinner(avgWindModel.getSpinnerModel());
+        avgWindSpinner.setEditor(new SpinnerEditor(avgWindSpinner));
+        avgWindSpinner.addChangeListener(e -> ext.setAverageWindSpeedMps(avgWindModel.getValue()));
+        UnitSelector avgWindUnit = new UnitSelector(avgWindModel);
+        panel.add(avgWindSpinner, "growx");
+        panel.add(avgWindUnit);
+
+        // enable/disable inputs based on toggle
+        java.util.function.Consumer<Boolean> setAvgEnabled = avgEnabled -> {
+            avgWindSpinner.setEnabled(avgEnabled);
+            avgWindUnit.setEnabled(avgEnabled);
+        };
+        
+        setAvgEnabled.accept(ext.isUseAverageWindSpeed());
+        useAvgWind.addActionListener(e -> {
+            boolean on = useAvgWind.isSelected();
+            ext.setUseAverageWindSpeed(on);
+            setAvgEnabled.accept(on);
+        });
+
         addAngleStdDev(panel, "Wind direction σ", UnitGroup.UNITS_ANGLE,
                 Math.toRadians(ext.getWindDirectionStdDevDeg()),
                 v -> ext.setWindDirectionStdDevDeg(Math.toDegrees(v)));
@@ -303,25 +329,27 @@ public class MonteCarloConfigurator
         panel.add(new UnitSelector(model));
     }
 
-    private static void addTemperatureStdDev(JPanel panel, String label, double initial, DoubleConsumer setter) {
-        panel.add(new JLabel(label), "align label");
-        DoubleModel model = new DoubleModel(initial, UnitGroup.UNITS_TEMPERATURE, 0);
-        model.setCurrentUnit(UnitGroup.UNITS_TEMPERATURE.getUnit("\u00B0C"));
-        JSpinner spinner = new JSpinner(model.getSpinnerModel());
-        spinner.setEditor(new SpinnerEditor(spinner));
-        spinner.addChangeListener(e -> setter.accept(model.getValue()));
-        panel.add(spinner, "growx");
-        panel.add(new UnitSelector(model));
-    }
+    private static void addTemperatureStdDev(JPanel panel, String label, double initialC, DoubleConsumer setter) {
+    panel.add(new JLabel(label), "align label");
 
-    private static void addPressureStdDev(JPanel panel, String label, double initial, DoubleConsumer setter) {
+    // σ as a delta in °C (Δ°C == ΔK)
+    JSpinner spinner = new JSpinner(new SpinnerNumberModel(initialC, 0.0, 500.0, 0.1));
+    spinner.setEditor(new SpinnerEditor(spinner));
+    spinner.addChangeListener(e -> setter.accept(((Number) spinner.getValue()).doubleValue()));
+
+    panel.add(spinner, "growx");
+    panel.add(new JLabel("°C"));   // explicitly delta °C
+    }
+    
+    private static void addPressureStdDev(JPanel panel, String label, double initialMbar, DoubleConsumer setter) {
         panel.add(new JLabel(label), "align label");
-        DoubleModel model = new DoubleModel(initial, UnitGroup.UNITS_PRESSURE, 0);
-        model.setCurrentUnit(UnitGroup.UNITS_PRESSURE.getUnit("mbar"));
-        JSpinner spinner = new JSpinner(model.getSpinnerModel());
+    
+        // σ as a delta in mbar
+        JSpinner spinner = new JSpinner(new SpinnerNumberModel(initialMbar, 0.0, 20000.0, 1.0));
         spinner.setEditor(new SpinnerEditor(spinner));
-        spinner.addChangeListener(e -> setter.accept(model.getValue()));
+        spinner.addChangeListener(e -> setter.accept(((Number) spinner.getValue()).doubleValue()));
+    
         panel.add(spinner, "growx");
-        panel.add(new UnitSelector(model));
+        panel.add(new JLabel("mbar"));
     }
 }

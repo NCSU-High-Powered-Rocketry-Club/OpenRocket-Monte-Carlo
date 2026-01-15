@@ -58,6 +58,10 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
     private double temperatureStdDevC = 0.0;       // degC (delta == delta K)
     private double pressureStdDevMbar = 0.0;       // mbar (1 mbar = 100 Pa)
 
+    // NEW: optional average wind speed override
+    private boolean useAverageWindSpeed = false;
+    private double averageWindSpeedMps = 0.0;      // m/s
+
     // Vehicle / initial state (may require deeper hooks depending on OR API)
     private double massStdDevPercent = 0.0;        // %
     private double initialVelocityStdDev = 0.0;    // m/s
@@ -125,10 +129,30 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
             for (MultiLevelPinkNoiseWindModel.LevelWindModel level : opts.getMultiLevelWindModel().getLevels()) {
 
                 // speed in m/s
-                if (windSpeedStdDev > 0) {
-                    double base = level.getSpeed();
-                    double varied = Math.max(0.0, base + rng.nextGaussian() * windSpeedStdDev);
+                if (useAverageWindSpeed) {
+                    double base = Math.max(0.0, averageWindSpeedMps);
+                    double varied = base;
+                    if (windSpeedStdDev > 0) {
+                        varied = base + rng.nextGaussian() * windSpeedStdDev;
+                        if (varied < 0.0) varied = 0.0;
+                    }
                     level.setSpeed(varied);
+
+                    if (debugEnabled) {
+                        log.debug("MC wind speed (avg override): base={} m/s, σ={} m/s, varied={} m/s",
+                                base, windSpeedStdDev, varied);
+                    }
+                } else {
+                    if (windSpeedStdDev > 0) {
+                        double base = level.getSpeed();          // current sim’s wind speed (m/s)
+                        double varied = base + rng.nextGaussian() * windSpeedStdDev;
+                        if (varied < 0.0) varied = 0.0;           // keep physical
+                        level.setSpeed(varied);
+
+                        if (debugEnabled) {
+                            log.debug("MC wind speed: base={} m/s, σ={} m/s, varied={} m/s", base, windSpeedStdDev, varied);
+                        }
+                    }
                 }
 
                 // direction stored in radians
@@ -145,8 +169,10 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
             double baseK = opts.getLaunchTemperature();
             if (!Double.isFinite(baseK) || baseK <= 0.0) baseK = DEFAULT_T0_K;
 
-            double variedK = baseK + rng.nextGaussian() * temperatureStdDevC;
-            if (!Double.isFinite(variedK) || variedK <= 0.0) variedK = DEFAULT_T0_K;
+            // clamp to something physically sane (tweak bounds for your use case)
+            double sigmaK = clamp(temperatureStdDevC, 0.0, 50.0);     // e.g., <= 50°C sigma
+            double variedK = baseK + rng.nextGaussian() * sigmaK;
+            variedK = clamp(variedK, 180.0, 330.0);                   // e.g., -93°C to +57°C
 
             opts.setLaunchTemperature(variedK);
         }
@@ -155,9 +181,9 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
             double basePa = opts.getLaunchPressure();
             if (!Double.isFinite(basePa) || basePa <= 0.0) basePa = DEFAULT_P0_PA;
 
-            double sigmaPa = pressureStdDevMbar * 100.0;
-            double variedPa = basePa + rng.nextGaussian() * sigmaPa;
-            if (!Double.isFinite(variedPa) || variedPa <= 0.0) variedPa = DEFAULT_P0_PA;
+            double sigmaMbar = clamp(pressureStdDevMbar, 0.0, 200.0); // e.g., <= 200 mbar sigma
+            double variedPa = basePa + rng.nextGaussian() * (sigmaMbar * 100.0);
+            variedPa = clamp(variedPa, 50_000.0, 120_000.0);          // e.g., ~500–1200 mbar
 
             opts.setLaunchPressure(variedPa);
         }
@@ -218,23 +244,23 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
      *
      * For r = 0, returns exactly 1.
      */
-    private static double drawLogNormalMultiplierMeanOne(double r, Random rng) {
-        if (!(r > 0.0) || !Double.isFinite(r)) {
-            return 1.0;
-        }
+    // private static double drawLogNormalMultiplierMeanOne(double r, Random rng) {
+    //     if (!(r > 0.0) || !Double.isFinite(r)) {
+    //         return 1.0;
+    //     }
 
-        // s^2 = ln(1 + r^2), mu = -s^2/2 ensures mean = 1
-        double s2 = Math.log1p(r * r);
-        double s = Math.sqrt(s2);
-        double mu = -0.5 * s2;
+    //     // s^2 = ln(1 + r^2), mu = -s^2/2 ensures mean = 1
+    //     double s2 = Math.log1p(r * r);
+    //     double s = Math.sqrt(s2);
+    //     double mu = -0.5 * s2;
 
-        double z = rng.nextGaussian();
-        double factor = Math.exp(mu + s * z);
+    //     double z = rng.nextGaussian();
+    //     double factor = Math.exp(mu + s * z);
 
-        // ultra-defensive guard
-        if (!Double.isFinite(factor) || factor <= 0.0) return 1.0;
-        return factor;
-    }
+    //     // ultra-defensive guard
+    //     if (!Double.isFinite(factor) || factor <= 0.0) return 1.0;
+    //     return factor;
+    // }
 
     /**
      * Recursively scales the mass of the component and all its children.
@@ -374,6 +400,13 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
 
     public double getWindSpeedStdDev() { return windSpeedStdDev; }
     public void setWindSpeedStdDev(double v) { windSpeedStdDev = Math.max(0.0, finiteOrZero(v)); fireChangeEvent(); }
+
+    // NEW: average wind speed toggle + value
+    public boolean isUseAverageWindSpeed() { return useAverageWindSpeed; }
+    public void setUseAverageWindSpeed(boolean v) { useAverageWindSpeed = v; fireChangeEvent(); }
+
+    public double getAverageWindSpeedMps() { return averageWindSpeedMps; }
+    public void setAverageWindSpeedMps(double v) { averageWindSpeedMps = Math.max(0.0, finiteOrZero(v)); fireChangeEvent(); }
 
     public double getWindDirectionStdDevDeg() { return windDirectionStdDevDeg; }
     public void setWindDirectionStdDevDeg(double v) { windDirectionStdDevDeg = Math.max(0.0, finiteOrZero(v)); fireChangeEvent(); }
