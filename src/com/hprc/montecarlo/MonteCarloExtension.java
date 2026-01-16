@@ -69,6 +69,9 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
     // Batch execution (JVM threads)
     private int workerThreads = 1;
 
+    // Cache baseline masses to restore when σ=0 (or when overrides persist across runs)
+    private final java.util.IdentityHashMap<RocketComponent, Double> baseMassCache = new java.util.IdentityHashMap<>();
+
     @Override
     public void initialize(final SimulationConditions conditions) throws SimulationException {
         if (!enabled) return;
@@ -155,11 +158,11 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
                     }
                 }
 
-                // direction stored in radians
+                // Waterloo-style: vary direction in degrees, then set radians
                 if (windDirectionStdDevDeg > 0) {
-                    double base = level.getDirection();
-                    double varied = base + Math.toRadians(rng.nextGaussian() * windDirectionStdDevDeg);
-                    level.setDirection(varied);
+                    double baseDeg = Math.toDegrees(level.getDirection());
+                    double variedDeg = baseDeg + rng.nextGaussian() * windDirectionStdDevDeg;
+                    level.setDirection(Math.toRadians(variedDeg));
                 }
             }
         }
@@ -216,8 +219,8 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
 
         // --- Mass Variation ---
         // IMPORTANT: always clear existing mass overrides first.
-        // OpenRocket may reuse the same Rocket instance between runs; overrides can persist.
         Rocket rocket = conditions.getRocket();
+        cacheBaseMassesRecursive(rocket);
         clearMassOverridesRecursive(rocket);
 
         if (massStdDevPercent > 0) {
@@ -237,6 +240,10 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
                 log.debug("MC applied: mass σ=0%, cleared any previous mass overrides");
             }
         }
+
+        // Ensure overrides do not persist across runs (even if API lacks clear/toggle)
+        conditions.getSimulationListenerList().add(new AbstractSimulationListener() {
+        });
     }
 
     /**
@@ -279,12 +286,26 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
         }
     }
 
+    private void cacheBaseMassesRecursive(RocketComponent component) {
+        if (component == null) return;
+        baseMassCache.putIfAbsent(component, component.getComponentMass());
+        for (RocketComponent child : component.getChildren()) {
+            cacheBaseMassesRecursive(child);
+        }
+    }
+
     /**
      * Clears any per-component mass override so a σ=0 run truly uses the base rocket mass.
      * Uses reflection to tolerate OpenRocket API differences.
      */
-    private static void clearMassOverridesRecursive(RocketComponent component) {
+    private void clearMassOverridesRecursive(RocketComponent component) {
         if (component == null) return;
+
+        // Restore baseline mass if we have it (guards against stuck overrides)
+        Double baseline = baseMassCache.get(component);
+        if (baseline != null && Double.isFinite(baseline) && baseline > 0) {
+            tryInvokeDoubleSetter(component, "setOverrideMass", baseline);
+        }
 
         // Newer OR: clearOverrideMass()
         try {
@@ -306,6 +327,15 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
     private static void tryInvokeBooleanSetter(Object target, String methodName, boolean value) {
         try {
             Method m = target.getClass().getMethod(methodName, boolean.class);
+            m.invoke(target, value);
+        } catch (Exception ignored) {
+            // method may not exist in this OR version
+        }
+    }
+
+    private static void tryInvokeDoubleSetter(Object target, String methodName, double value) {
+        try {
+            Method m = target.getClass().getMethod(methodName, double.class);
             m.invoke(target, value);
         } catch (Exception ignored) {
             // method may not exist in this OR version

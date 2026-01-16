@@ -1,296 +1,246 @@
 package com.hprc.montecarlo;
 
 import info.openrocket.core.document.Simulation;
-import info.openrocket.core.models.wind.MultiLevelPinkNoiseWindModel;
 import info.openrocket.core.simulation.FlightData;
 import info.openrocket.core.simulation.FlightDataBranch;
 import info.openrocket.core.simulation.FlightDataType;
 import info.openrocket.core.simulation.FlightEvent;
-import info.openrocket.core.simulation.exception.SimulationException;
-import info.openrocket.core.unit.Unit;
-import info.openrocket.core.unit.UnitGroup;
-import info.openrocket.core.util.Chars;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import info.openrocket.core.simulation.SimulationOptions;
 
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Comparator;
 import java.util.List;
-import java.util.Optional;
-import java.util.stream.Collectors;
 
 /**
- * Relevant data collected from run one of a simulation
+ * SimulationData
+ *
+ * Purpose:
+ * Extract key scalar results and landing location from an OpenRocket simulation run,
+ * using Python-style logic:
+ * - detect event time (apogee, landing)
+ * - choose nearest sample index: argmin(|t - t_event|)
+ * - read POSITION_X/Y at landing index
+ * - rotate downrange/crossrange -> ENU east/north using launch rod direction
+ * - compute landing lat/lon from ENU + launch lat/lon (degrees)
+ *
+ * Output feeds MonteCarloRunRecord and LandingDispersion6DOF.
  */
-public class SimulationData {
-    private final static Logger log = LoggerFactory.getLogger(SimulationData.class);
-    private final String name;
-    private final List<String> branchName = new ArrayList<>();
-    private final List<Double> minStability = new ArrayList<>();
-    private final List<Double> maxStability = new ArrayList<>();
-    private final List<Double> apogeeStability = new ArrayList<>();
-    private final List<Double> initStability = new ArrayList<>();
-    private final List<Double> landingLatitude = new ArrayList<>();
-    private final List<Double> landingLongitude = new ArrayList<>();
-    private final List<Double> eastPosLanding = new ArrayList<>();
-    private final List<Double> northPosLanding = new ArrayList<>();
-    private final List<Double> apogeeLateralVelocity = new ArrayList<>();
+public final class SimulationData {
 
-    private final double temperature;
-    private final double pressure;
-    private Simulation simulation;
-    private double apogee;
-    private double maxVelocity;
-    private double maxMachNumber;
-    private double maxWindSpeed;
-    private double maxWindDirection;
-    private boolean hasData = false;
+    // ---------------------------------------------------------------------------
+    // Fields stored per run
+    // ---------------------------------------------------------------------------
 
-    public SimulationData(Simulation simulation) {
-        this.simulation = simulation;
-        this.name = simulation.getName();
+    // Basic outcome
+    public double apogee_m;           // Altitude (MSL or AGL depending on simulation configuration)
+    public double apogeeTime_s;
 
-        Optional<MultiLevelPinkNoiseWindModel.LevelWindModel> maxWindSpdLevel = simulation.getOptions().getMultiLevelWindModel().getLevels().stream()
-                .max(Comparator.comparingDouble(MultiLevelPinkNoiseWindModel.LevelWindModel::getSpeed));
-        maxWindSpeed = 0;
-        maxWindDirection = 0;
-        if (maxWindSpdLevel.isPresent()) {
-            maxWindSpeed = maxWindSpdLevel.get().getSpeed();
-            maxWindDirection = maxWindSpdLevel.get().getDirection();
-        }
+    public double landingTime_s;
+    public double landingEast_m;      // ENU (meters)
+    public double landingNorth_m;     // ENU (meters)
+    public double landingLat_deg;     // Computed from ENU + launch lat/lon
+    public double landingLon_deg;
 
-        this.temperature = simulation.getOptions().getLaunchTemperature();
-        this.pressure = simulation.getOptions().getLaunchPressure();
-    }
+    // Optional debugging: raw OR frame at landing (downrange/crossrange)
+    public double landingDownrange_m;
+    public double landingCrossrange_m;
+
+    // Launch site used
+    public double launchLat_deg;
+    public double launchLon_deg;
+    public double launchRodDirection_deg;
+
+    // Status flags
+    public boolean hasLanding = false;
+    public boolean hasApogee = false;
+    public String simulationName;
+
+    // ---------------------------------------------------------------------------
+    // Factory / Main Entry
+    // ---------------------------------------------------------------------------
 
     /**
-     * Process simulated data. If keepSimulationObject is false, removes the underlying simulation object to save memory.
-     * After calling the simulation object is no longer accessible
+     * Extract from Simulation after it has been simulated.
      *
-     * @param keepSimulationObject whether to keep the underlying simulation object. Should be false unless testing
-     * @see SimulationData#getSimulation()
+     * @param sim         - already run simulation
+     * @param branchIndex - usually 0 for the main flight branch
      */
-    public void processData(boolean keepSimulationObject) throws SimulationException {
-        if (!simulation.hasSimulationData())
-            throw new SimulationException("No simulation data recorded. Run a simulation first");
-        log.info("Processing data for simulation {}", simulation.getName());
+    public static SimulationData fromSimulation(Simulation sim, int branchIndex) {
 
-        FlightData data = simulation.getSimulatedData();
+        SimulationData out = new SimulationData();
+        out.simulationName = sim.getName();
 
-        apogee = data.getMaxAltitude();
-        maxVelocity = data.getMaxVelocity();
-        maxMachNumber = data.getMaxMachNumber();
+        // 1) Pull launch site & heading from simulation options
+        SimulationOptions opts = sim.getOptions();
+        out.launchLat_deg = opts.getLaunchLatitude();
+        out.launchLon_deg = opts.getLaunchLongitude();
+        // OR stores rod direction in radians; convert to degrees for consistency
+        out.launchRodDirection_deg = Math.toDegrees(opts.getLaunchRodDirection());
 
-        List<FlightDataBranch> flightDataBranches = data.getBranches();
-
-        for (FlightDataBranch branch : flightDataBranches) {
-            // the flight data consists of multiple lists of values calculated at each step of the simulation
-            // so we look through all this data to get what we need
-
-            List<Double> time = branch.get(FlightDataType.TYPE_TIME);
-            List<Double> lat = branch.get(FlightDataType.TYPE_LATITUDE);
-            List<Double> lng = branch.get(FlightDataType.TYPE_LONGITUDE);
-            List<Double> eastPos = branch.get(FlightDataType.TYPE_POSITION_X);
-            List<Double> northPos = branch.get(FlightDataType.TYPE_POSITION_Y);
-            List<Double> latVelocity = branch.get(FlightDataType.TYPE_VELOCITY_XY);
-
-            double branchMaxAltitude = branch.getMaximum(FlightDataType.TYPE_ALTITUDE);
-            double branchMaxVelocity = branch.getMaximum(FlightDataType.TYPE_VELOCITY_TOTAL);
-            double branchMaxMachNumber = branch.getMaximum(FlightDataType.TYPE_MACH_NUMBER);
-
-            if (branchMaxAltitude != apogee) {
-                log.warn("Branch altitude {} is different than expected {}", branchMaxAltitude, apogee);
-            }
-            if (branchMaxVelocity != maxVelocity) {
-                log.warn("Branch max velocity {} is different than expected {}", branchMaxVelocity, maxVelocity);
-            }
-            if (branchMaxMachNumber != maxMachNumber) {
-                log.warn("Branch max mach number {} is different than expected {}", branchMaxMachNumber, maxMachNumber);
-            }
-
-            double landingTime = branch.getEvents().stream()
-                    .filter(e -> e.getType() == FlightEvent.Type.GROUND_HIT).findFirst()
-                    .orElseThrow().getTime();
-            double apogeeTime = data.getTimeToApogee();
-
-            int apogeeIndex = Collections.binarySearch(time, apogeeTime);
-            int landingIndex = Collections.binarySearch(time, landingTime);
-            if (apogeeIndex < 0) {
-                throw new SimulationException("Time to apogee does not correspond to a valid index");
-            }
-            if (landingIndex < 0) {
-                throw new SimulationException("Time to landing does not correspond to a valid index");
-            }
-
-            List<Double> stability = branch.get(FlightDataType.TYPE_STABILITY);
-
-            double minStability = Double.NaN;
-            double initStability = Double.NaN;
-            for (int i = 0; i < time.size(); i++) {
-                Double s = stability.get(i);
-                // stop considering stability 10s before apogee
-                // as well, stability will be NaN if the launch rod is not cleared or the forces are not
-                if (time.get(i) + 10 <= apogeeTime && !s.isNaN()) {
-                    if (Double.isNaN(minStability) || s < minStability) {
-                        minStability = s;
-                    }
-                }
-                if (Double.isNaN(initStability) && !s.isNaN()) {
-                    initStability = s;
-                }
-
-                if (!Double.isNaN(initStability) && time.get(i) > apogeeTime) break;
-            }
-
-            this.branchName.add(branch.getName());
-            this.minStability.add(minStability);
-            this.maxStability.add(branch.getMaximum(FlightDataType.TYPE_STABILITY));
-            this.initStability.add(initStability);
-            this.apogeeStability.add(stability.get(apogeeIndex));
-            this.landingLatitude.add(lat.get(landingIndex));
-            this.landingLongitude.add(lng.get(landingIndex));
-            this.eastPosLanding.add(eastPos.get(landingIndex));
-            this.northPosLanding.add(northPos.get(landingIndex));
-            this.apogeeLateralVelocity.add(latVelocity.get(apogeeIndex));
+        // 2) Pull flight branch data
+        if (!sim.hasSimulationData()) {
+            throw new IllegalStateException("Simulation '" + sim.getName() + "' has no data; run simulation first.");
         }
 
-        this.hasData = true;
-        if (!keepSimulationObject)
-            this.simulation = null; // remove the simulation object to save memory
+        FlightData flight = sim.getSimulatedData();
+        FlightDataBranch branch = flight.getBranch(branchIndex);
+
+        // 3) Extract time series arrays needed
+        List<Double> time = branch.get(FlightDataType.TYPE_TIME);
+        List<Double> altitude = branch.get(FlightDataType.TYPE_ALTITUDE); // meters
+        List<Double> posX = branch.get(FlightDataType.TYPE_POSITION_X);   // meters (Downrange)
+        List<Double> posY = branch.get(FlightDataType.TYPE_POSITION_Y);   // meters (Crossrange)
+
+        // Validate lengths
+        int n = min(time.size(), altitude.size(), posX.size(), posY.size());
+        if (n <= 0) {
+            throw new IllegalStateException("Flight data arrays empty for simulation: " + sim.getName());
+        }
+
+        // 4) Determine apogee time
+        // Prefer event timestamp if present; fallback to argmax(altitude)
+        Double apogeeTime = findEventTime(branch, FlightEvent.Type.APOGEE);
+
+        if (isValid(apogeeTime)) {
+            int iApo = nearestIndex(time, apogeeTime);
+            out.apogeeTime_s = time.get(iApo);
+            out.apogee_m = altitude.get(iApo);
+            out.hasApogee = true;
+        } else {
+            int iApo = argMaxIndex(altitude, n);
+            out.apogeeTime_s = time.get(iApo);
+            out.apogee_m = altitude.get(iApo);
+            out.hasApogee = true;
+        }
+
+        // 5) Determine landing time (GROUND_HIT) and pick nearest index
+        Double landingTime = findEventTime(branch, FlightEvent.Type.GROUND_HIT);
+
+        if (isValid(landingTime)) {
+            int iLand = nearestIndex(time, landingTime);
+
+            out.landingTime_s = time.get(iLand);
+            out.hasLanding = true;
+
+            // 5a) Extract raw OR X/Y at landing index
+            double down = posX.get(iLand);
+            double cross = posY.get(iLand);
+
+            out.landingDownrange_m = down;
+            out.landingCrossrange_m = cross;
+
+            // 5b) Rotate and Compute Lat/Lon
+            computeLandingENU(out, down, cross);
+
+        } else {
+            // No landing event found (sim stopped early or crashed).
+            // Fallback: use the very last sample point available.
+            int iLand = n - 1;
+
+            out.landingTime_s = time.get(iLand);
+            out.hasLanding = false;
+
+            double down = posX.get(iLand);
+            double cross = posY.get(iLand);
+            out.landingDownrange_m = down;
+            out.landingCrossrange_m = cross;
+
+            computeLandingENU(out, down, cross);
+        }
+
+        return out;
     }
 
     /**
-     * @return Underlying OpenRocket simulation object
-     * @apiNote Should not be used after processData call if simulation object is not kept
-     * @see SimulationData#processData(boolean)
+     * Helper to perform coordinate rotation and Lat/Lon conversion.
      */
-    public Simulation getSimulation() {
-        return simulation;
+    private static void computeLandingENU(SimulationData out, double down, double cross) {
+        // Rotate down/cross -> ENU east/north using rod direction (clockwise from North)
+        double az = Math.toRadians(out.launchRodDirection_deg);
+
+        // Rotation logic:
+        // Downrange (X) is along the azimuth.
+        // Crossrange (Y) is perpendicular (Right hand rule).
+        // East  = down * sin(az) + cross * cos(az)
+        // North = down * cos(az) - cross * sin(az)
+        out.landingEast_m = down * Math.sin(az) + cross * Math.cos(az);
+        out.landingNorth_m = down * Math.cos(az) - cross * Math.sin(az);
+
+        // 5c) Compute landing lat/lon (degrees) from ENU and launch site
+        // Uses the static helper from LandingDispersion6DOF
+        double[] ll = LandingDispersion6DOF.enuToLatLonDeg(
+                out.landingEast_m,
+                out.landingNorth_m,
+                out.launchLat_deg,
+                out.launchLon_deg
+        );
+        out.landingLat_deg = ll[0];
+        out.landingLon_deg = ll[1];
     }
 
-    public boolean hasData() {
-        return hasData;
+    // ---------------------------------------------------------------------------
+    // Event time extraction
+    // ---------------------------------------------------------------------------
+
+    private static Double findEventTime(FlightDataBranch branch, FlightEvent.Type type) {
+        // Iterate branch events; return first matching time
+        for (FlightEvent e : branch.getEvents()) {
+            if (e.getType() == type) return e.getTime();
+        }
+        return Double.NaN;
     }
 
-    // branch dependent values
-    public List<String> getBranchName() {
-        return branchName;
+    private static boolean isValid(Double d) {
+        return d != null && !Double.isNaN(d) && !Double.isInfinite(d);
     }
 
-    public List<Double> getMinStability() {
-        return minStability;
+    // ---------------------------------------------------------------------------
+    // Python-style nearest index selection
+    // ---------------------------------------------------------------------------
+
+    /**
+     * Return index i that minimizes |time[i] - t|.
+     * Matches Python: argmin(abs(time - t_event)).
+     */
+    private static int nearestIndex(List<Double> time, double tEvent) {
+        int bestI = 0;
+        double bestErr = Double.MAX_VALUE;
+
+        for (int i = 0; i < time.size(); i++) {
+            double err = Math.abs(time.get(i) - tEvent);
+            if (err < bestErr) {
+                bestErr = err;
+                bestI = i;
+            }
+        }
+        return bestI;
     }
 
-    public List<Double> getMaxStability() {
-        return maxStability;
+    // ---------------------------------------------------------------------------
+    // Argmax helper
+    // ---------------------------------------------------------------------------
+
+    private static int argMaxIndex(List<Double> arr, int n) {
+        int bestI = 0;
+        double bestV = Double.NEGATIVE_INFINITY;
+
+        for (int i = 0; i < n; i++) {
+            double v = arr.get(i);
+            if (v > bestV) {
+                bestV = v;
+                bestI = i;
+            }
+        }
+        return bestI;
     }
 
-    public List<Double> getApogeeStability() {
-        return apogeeStability;
-    }
+    // ---------------------------------------------------------------------------
+    // Utility math helpers
+    // ---------------------------------------------------------------------------
 
-    public List<Double> getInitStability() {
-        return initStability;
-    }
-
-    public List<Double> getLandingLatitude() {
-        return landingLatitude;
-    }
-
-    public List<Double> getLandingLongitude() {
-        return landingLongitude;
-    }
-
-    public List<Double> getEastPosLanding() {
-        return eastPosLanding;
-    }
-
-    public List<Double> getNorthPosLanding() {
-        return northPosLanding;
-    }
-
-    public List<Double> getApogeeLateralVelocity() {
-        return apogeeLateralVelocity;
-    }
-
-
-    // global values
-    public String getName() {
-        return name;
-    }
-
-    public double getApogee() {
-        return apogee;
-    }
-
-    public double getMaxVelocity() {
-        return maxVelocity;
-    }
-
-    public double getMaxMachNumber() {
-        return maxMachNumber;
-    }
-
-    public double getMaxWindSpeed() {
-        return maxWindSpeed;
-    }
-
-    public double getMaxWindDirection() {
-        return maxWindDirection;
-    }
-
-    public double getTemperature() {
-        return temperature;
-    }
-
-    public double getPressure() {
-        return pressure;
-    }
-
-    // converted values
-    public List<Double> getEastPostLandingInFeet() {
-        Unit ftUnit = UnitGroup.UNITS_LENGTH.getUnit("ft");
-        return this.getEastPosLanding().stream().map(ftUnit::toUnit).collect(Collectors.toList());
-    }
-
-    public List<Double> getNorthPostLandingInFeet() {
-        Unit ftUnit = UnitGroup.UNITS_LENGTH.getUnit("ft");
-        return this.getNorthPosLanding().stream().map(ftUnit::toUnit).collect(Collectors.toList());
-    }
-
-    public double getApogeeInFeet() {
-        return UnitGroup.UNITS_LENGTH.getUnit("ft")
-                .toUnit(this.getApogee());
-    }
-
-    public double getTemperatureInCelsius() {
-        return UnitGroup.UNITS_TEMPERATURE.getUnit(Chars.DEGREE + "C")
-                .toUnit(this.getTemperature());
-    }
-
-    public double getPressureInMBar() {
-        return UnitGroup.UNITS_PRESSURE.getUnit("mbar")
-                .toUnit(this.getPressure());
-    }
-
-    public double getMaxWindSpeedInMPH() {
-        return UnitGroup.UNITS_VELOCITY.getUnit("mph")
-                .toUnit(this.getMaxWindSpeed());
-    }
-
-    public double getMaxWindDirectionInDegrees() {
-        return UnitGroup.UNITS_ANGLE.getUnit(String.valueOf(Chars.DEGREE))
-                .toUnit(this.getMaxWindDirection());
-    }
-
-    @Override
-    public String toString() {
-        return "Simulation " + name + ": " +
-                "apogee=" + apogee +
-                ", maxWindSpeed=" + maxWindSpeed +
-                ", maxWindDirection=" + maxWindDirection +
-                ", temperature=" + temperature +
-                ", pressure=" + pressure;
+    private static int min(int... vals) {
+        int m = Integer.MAX_VALUE;
+        for (int v : vals) {
+            if (v < m) m = v;
+        }
+        return m;
     }
 }

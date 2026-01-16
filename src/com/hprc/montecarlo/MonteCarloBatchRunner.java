@@ -74,11 +74,15 @@ public final class MonteCarloBatchRunner {
             SimulationRunner.runSimulationInProcess(s);
 
             // Extract results
-            SimulationData data = new SimulationData(s);
-            data.processData(true); // keep sim object while we snapshot options (safe, runs count is your choice)
+            SimulationData data = SimulationData.fromSimulation(s, 0);
 
             SimulationOptions opts = s.getOptions();
-            out.add(new MonteCarloRunRecord(runIndex, s.getName(), det, seedUsed, opts, data));
+            MonteCarloRunRecord rec = new MonteCarloRunRecord(runIndex, s.getName(), det, seedUsed, opts, data);
+            rec.setLandingEastM(data.landingEast_m);
+            rec.setLandingNorthM(data.landingNorth_m);
+            rec.setLandingLatDeg(data.landingLat_deg);
+            rec.setLandingLonDeg(data.landingLon_deg);
+            out.add(rec);
 
             if (cb != null) cb.onProgress(runIndex, runs, "Completed " + runIndex + " / " + runs);
         }
@@ -163,16 +167,19 @@ public final class MonteCarloBatchRunner {
                         SimulationRunner.runSimulationInProcess(s);
 
                         // Extract results
-                        SimulationData data = new SimulationData(s);
-                        data.processData(true);
+                        SimulationData data = SimulationData.fromSimulation(s, 0);
 
                         SimulationOptions opts = s.getOptions();
-                        results[runZeroBased] = new MonteCarloRunRecord(runIndex, s.getName(), det, seedUsed, opts, data);
+                        MonteCarloRunRecord rec = new MonteCarloRunRecord(runIndex, s.getName(), det, seedUsed, opts, data);
+                        rec.setLandingEastM(data.landingEast_m);
+                        rec.setLandingNorthM(data.landingNorth_m);
+                        rec.setLandingLatDeg(data.landingLat_deg);
+                        rec.setLandingLonDeg(data.landingLon_deg);
+                        results[runZeroBased] = rec;
 
                         int done = completed.incrementAndGet();
                         safeCb.onProgress(done, runs, "Completed " + done + " / " + runs);
                     } catch (Exception ex) {
-                        // Surface error to Future.get() as-is
                         throw new RuntimeException(ex);
                     }
                 }));

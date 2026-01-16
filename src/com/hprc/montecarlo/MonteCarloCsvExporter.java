@@ -21,9 +21,8 @@ public final class MonteCarloCsvExporter {
             throw new IOException("No records to export.");
         }
 
-        // Determine max wind level count and branch count for column layout
+        // Determine max wind level count for column layout
         int maxWindLevels = records.stream().mapToInt(r -> r.windLevels.size()).max().orElse(0);
-        int branchCount = records.get(0).results.getBranchName().size();
 
         try (BufferedWriter w = new BufferedWriter(new FileWriter(file))) {
             // Header
@@ -43,31 +42,11 @@ public final class MonteCarloCsvExporter {
                       .append("wind_level_").append(n).append("_std_mps,");
             }
 
-            // Global outputs
-            header.append("apogee_m,apogee_ft,max_velocity_mps,max_mach,");
+            // Outputs from updated SimulationData
+            header.append("apogee_m,apogee_time_s,landing_time_s,")
+                  .append("landing_east_m,landing_north_m,landing_lat_deg,landing_lon_deg,")
+                  .append("landing_downrange_m,landing_crossrange_m,has_apogee,has_landing");
 
-            // Branch outputs (same pattern you already export)
-            String[] branchHeaders = {
-                    "Initial_Stability",
-                    "Min_Stability",
-                    "Max_Stability",
-                    "Apogee_Stability",
-                    "Landing_Latitude_degN",
-                    "Landing_Longitude_degE",
-                    "Position_East_of_Launch_ft",
-                    "Position_North_of_Launch_ft",
-                    "Lateral_Velocity_at_Apogee_mps"
-            };
-
-            for (int b = 0; b < branchCount; b++) {
-                String bn = safe(records.get(0).results.getBranchName().get(b));
-                for (String lbl : branchHeaders) {
-                    header.append(bn).append("_").append(lbl).append(",");
-                }
-            }
-
-            // trim trailing comma
-            header.setLength(header.length() - 1);
             w.write(header.toString());
             w.write("\n");
 
@@ -108,27 +87,18 @@ public final class MonteCarloCsvExporter {
                     }
                 }
 
-                // global outputs
-                row.append(d.getApogee()).append(",")
-                   .append(d.getApogeeInFeet()).append(",")
-                   .append(d.getMaxVelocity()).append(",")
-                   .append(d.getMaxMachNumber()).append(",");
+                row.append(d.apogee_m).append(",")
+                   .append(d.apogeeTime_s).append(",")
+                   .append(d.landingTime_s).append(",")
+                   .append(d.landingEast_m).append(",")
+                   .append(d.landingNorth_m).append(",")
+                   .append(d.landingLat_deg).append(",")
+                   .append(d.landingLon_deg).append(",")
+                   .append(d.landingDownrange_m).append(",")
+                   .append(d.landingCrossrange_m).append(",")
+                   .append(d.hasApogee).append(",")
+                   .append(d.hasLanding);
 
-                // branch outputs
-                for (int b = 0; b < branchCount; b++) {
-                    row.append(d.getInitStability().get(b)).append(",")
-                       .append(d.getMinStability().get(b)).append(",")
-                       .append(d.getMaxStability().get(b)).append(",")
-                       .append(d.getApogeeStability().get(b)).append(",")
-                       .append(d.getLandingLatitude().get(b)).append(",")
-                       .append(d.getLandingLongitude().get(b)).append(",")
-                       .append(d.getEastPostLandingInFeet().get(b)).append(",")
-                       .append(d.getNorthPostLandingInFeet().get(b)).append(",")
-                       .append(d.getApogeeLateralVelocity().get(b)).append(",");
-                }
-
-                // trim trailing comma
-                row.setLength(row.length() - 1);
                 w.write(row.toString());
                 w.write("\n");
             }

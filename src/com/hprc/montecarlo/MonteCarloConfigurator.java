@@ -2,6 +2,7 @@ package com.hprc.montecarlo;
 
 import info.openrocket.core.document.Simulation;
 import info.openrocket.core.plugin.Plugin;
+import info.openrocket.core.simulation.SimulationOptions;
 import info.openrocket.core.unit.UnitGroup;
 import info.openrocket.swing.gui.SpinnerEditor;
 import info.openrocket.swing.gui.adaptors.DoubleModel;
@@ -13,8 +14,12 @@ import javax.swing.*;
 import javax.swing.filechooser.FileNameExtensionFilter;
 import java.awt.*;
 import java.io.File;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 import java.util.function.DoubleConsumer;
 
 /**
@@ -96,7 +101,7 @@ public class MonteCarloConfigurator
         addVelocityStdDev(panel, "Wind speed σ",
                 ext.getWindSpeedStdDev(), ext::setWindSpeedStdDev);
 
-        // NEW: optional average wind speed override
+        // Optional average wind speed override
         JCheckBox useAvgWind = new JCheckBox("Use average wind speed", ext.isUseAverageWindSpeed());
         panel.add(useAvgWind, "span 3, wrap");
 
@@ -110,11 +115,11 @@ public class MonteCarloConfigurator
         panel.add(avgWindUnit);
 
         // enable/disable inputs based on toggle
-        java.util.function.Consumer<Boolean> setAvgEnabled = avgEnabled -> {
+        Consumer<Boolean> setAvgEnabled = avgEnabled -> {
             avgWindSpinner.setEnabled(avgEnabled);
             avgWindUnit.setEnabled(avgEnabled);
         };
-        
+
         setAvgEnabled.accept(ext.isUseAverageWindSpeed());
         useAvgWind.addActionListener(e -> {
             boolean on = useAvgWind.isSelected();
@@ -125,7 +130,7 @@ public class MonteCarloConfigurator
         addAngleStdDev(panel, "Wind direction σ", UnitGroup.UNITS_ANGLE,
                 Math.toRadians(ext.getWindDirectionStdDevDeg()),
                 v -> ext.setWindDirectionStdDevDeg(Math.toDegrees(v)));
-                
+
         addTemperatureStdDev(panel, "Temperature σ",
                 ext.getTemperatureStdDevC(), ext::setTemperatureStdDevC);
 
@@ -154,7 +159,7 @@ public class MonteCarloConfigurator
         panel.add(new JSeparator(), "span 3, growx");
         panel.add(sectionLabel("Batch run / Export"), "span 3, growx");
 
-        // NEW: Worker threads selector (JVM threads)
+        // Worker threads selector (JVM threads)
         panel.add(new JLabel("Worker threads"), "align label");
         int maxThreads = Math.max(1, Runtime.getRuntime().availableProcessors());
         int initialThreads = Math.min(Math.max(1, ext.getWorkerThreads()), maxThreads);
@@ -171,11 +176,18 @@ public class MonteCarloConfigurator
 
         final JButton runBatch = new JButton("Run Monte Carlo Batch");
         final JButton exportDetailed = new JButton("Export Detailed CSV");
+
+        // UPDATED: one-button export that calls LandingDispersion6DOF.exportAll(...)
+        final JButton exportDispersionBundle = new JButton("Export Landing Dispersion (KML + CSV)");
+
         exportDetailed.setEnabled(false);
+        exportDispersionBundle.setEnabled(false);
 
         runBatch.addActionListener(e -> {
             runBatch.setEnabled(false);
             exportDetailed.setEnabled(false);
+            exportDispersionBundle.setEnabled(false);
+
             lastBatchResults.set(null);
 
             progress.setMaximum(Math.max(1, ext.getNumberOfSimulations()));
@@ -220,7 +232,9 @@ public class MonteCarloConfigurator
 
                         progress.setValue(progress.getMaximum());
                         progress.setString("Done (" + results.size() + " runs)");
+
                         exportDetailed.setEnabled(true);
+                        exportDispersionBundle.setEnabled(true);
                     } catch (Exception ex) {
                         progress.setString("Failed");
                         JOptionPane.showMessageDialog(panel,
@@ -255,7 +269,7 @@ public class MonteCarloConfigurator
             if (option != JFileChooser.APPROVE_OPTION) return;
 
             File file = chooser.getSelectedFile();
-            if (!file.getName().toLowerCase().endsWith(".csv")) {
+            if (!file.getName().toLowerCase(Locale.US).endsWith(".csv")) {
                 file = new File(file.getParentFile(), file.getName() + ".csv");
             }
 
@@ -273,10 +287,70 @@ public class MonteCarloConfigurator
             }
         });
 
+        // UPDATED: Export landing dispersion bundle (KML + points CSV + summary CSV)
+        exportDispersionBundle.addActionListener(e -> {
+            List<MonteCarloRunRecord> results = lastBatchResults.get();
+            if (results == null || results.isEmpty()) {
+                JOptionPane.showMessageDialog(panel,
+                        "No batch results available. Run a batch first.",
+                        "Nothing to Export",
+                        JOptionPane.WARNING_MESSAGE);
+                return;
+            }
+
+            // Choose output folder (directory)
+            JFileChooser chooser = new JFileChooser();
+            chooser.setDialogTitle("Select output folder for Landing Dispersion exports");
+            chooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
+            chooser.setAcceptAllFileFilterUsed(false);
+
+            int option = chooser.showSaveDialog(panel);
+            if (option != JFileChooser.APPROVE_OPTION) return;
+
+            File dir = chooser.getSelectedFile();
+            if (dir == null) return;
+
+            // Pull launch site lat/lon from OpenRocket simulation options
+            SimulationOptions opts = sim.getOptions();
+            double launchLatDeg = opts.getLaunchLatitude();
+            double launchLonDeg = opts.getLaunchLongitude();
+
+            try {
+                // Reflect the requested pattern:
+                String outputFolder = dir.getAbsolutePath();
+                Path outDir = Paths.get(outputFolder);        // whatever you already use
+                LandingDispersion6DOF.exportAll(
+                        outDir,
+                        "landing_dispersion",
+                        results,           // List<MonteCarloRunRecord>
+                        launchLatDeg,
+                        launchLonDeg
+                );
+
+                JOptionPane.showMessageDialog(panel,
+                        "Exported to:\n" + outDir.toAbsolutePath() + "\n\n" +
+                        "Files:\n" +
+                        " - landing_dispersion.kml\n" +
+                        " - landing_dispersion_points.csv\n" +
+                        " - landing_dispersion_summary.csv",
+                        "Export Complete",
+                        JOptionPane.INFORMATION_MESSAGE);
+            } catch (Exception ex) {
+                JOptionPane.showMessageDialog(panel,
+                        "Export failed:\n" + ex.getMessage(),
+                        "Export Error",
+                        JOptionPane.ERROR_MESSAGE);
+            }
+        });
+
         panel.add(runBatch, "span 2, growx");
         panel.add(exportDetailed, "growx");
 
-        return panel;
+        panel.add(exportDispersionBundle, "span 3, growx");
+
+        JScrollPane scroll = new JScrollPane(panel);
+        scroll.setBorder(null);
+        return scroll;
     }
 
     // ---------------------------------------------------------------------
@@ -330,25 +404,25 @@ public class MonteCarloConfigurator
     }
 
     private static void addTemperatureStdDev(JPanel panel, String label, double initialC, DoubleConsumer setter) {
-    panel.add(new JLabel(label), "align label");
+        panel.add(new JLabel(label), "align label");
 
-    // σ as a delta in °C (Δ°C == ΔK)
-    JSpinner spinner = new JSpinner(new SpinnerNumberModel(initialC, 0.0, 500.0, 0.1));
-    spinner.setEditor(new SpinnerEditor(spinner));
-    spinner.addChangeListener(e -> setter.accept(((Number) spinner.getValue()).doubleValue()));
+        // σ as a delta in °C (Δ°C == ΔK)
+        JSpinner spinner = new JSpinner(new SpinnerNumberModel(initialC, 0.0, 500.0, 0.1));
+        spinner.setEditor(new SpinnerEditor(spinner));
+        spinner.addChangeListener(e -> setter.accept(((Number) spinner.getValue()).doubleValue()));
 
-    panel.add(spinner, "growx");
-    panel.add(new JLabel("°C"));   // explicitly delta °C
+        panel.add(spinner, "growx");
+        panel.add(new JLabel("°C"));
     }
-    
+
     private static void addPressureStdDev(JPanel panel, String label, double initialMbar, DoubleConsumer setter) {
         panel.add(new JLabel(label), "align label");
-    
+
         // σ as a delta in mbar
         JSpinner spinner = new JSpinner(new SpinnerNumberModel(initialMbar, 0.0, 20000.0, 1.0));
         spinner.setEditor(new SpinnerEditor(spinner));
         spinner.addChangeListener(e -> setter.accept(((Number) spinner.getValue()).doubleValue()));
-    
+
         panel.add(spinner, "growx");
         panel.add(new JLabel("mbar"));
     }

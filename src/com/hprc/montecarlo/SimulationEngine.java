@@ -56,9 +56,18 @@ public class SimulationEngine {
     private final Configurator config = Configurator.getInstance();
     private final boolean keepSimulationObject = config.isKeepSimulationObject();
     private final OpenRocketDocument document;
-    private final List<SimulationData> data = new ArrayList<>();
+    private final List<RunEntry> runs = new ArrayList<>();
 
-    private double windDirStdDevRad, tempStdDev, pressureStdDev;
+    private static final class RunEntry {
+        final Simulation simulation;
+        SimulationData data;
+
+        RunEntry(Simulation simulation) {
+            this.simulation = simulation;
+        }
+    }
+
+    private double windDirStdDevDeg, tempStdDev, pressureStdDev;
 
     private static final double DEFAULT_T0_K = 288.15;      // 15 C
     private static final double DEFAULT_P0_PA = 101325.0;   // sea-level standard
@@ -141,13 +150,13 @@ public class SimulationEngine {
                             simData[2 + i * CSV_WIND_LEVEL_COLUMN_COUNT + 1]);
                 }
 
-                SimulationData simulationData = new SimulationData(simulation);
+                SimulationData simulationData = null;
                 log.debug(simulationData.toString());
 
-                data.add(simulationData);
+                runs.add(new RunEntry(simulation));
             }
         }
-        this.simulationCount = data.size();
+        this.simulationCount = runs.size();
     }
 
     /**
@@ -165,8 +174,7 @@ public class SimulationEngine {
                      double windDirStdDevDeg, double tempStdDev, double pressureStdDev) {
         this.document = document;
         this.simulationCount = simulationCount;
-        // store as radians to match internal direction units
-        this.windDirStdDevRad = Math.toRadians(windDirStdDevDeg);
+        this.windDirStdDevDeg = windDirStdDevDeg;
         this.tempStdDev = tempStdDev;
         this.pressureStdDev = pressureStdDev;
     }
@@ -183,7 +191,7 @@ public class SimulationEngine {
         this.simulationCount = sims.size();
 
         for (Simulation sim : sims) {
-            data.add(new SimulationData(sim));
+            runs.add(new RunEntry(sim));
         }
     }
 
@@ -206,7 +214,7 @@ public class SimulationEngine {
      * @see SimulationEngine#configureMonteCarloSimulationOptions(SimulationOptions)
      */
     public void createMonteCarloSimulations(Simulation referenceSim) {
-        data.clear();
+        runs.clear();
         for (int i = 0; i < simulationCount; i++) {
             // CLONE the rocket so MonteCarloExtension can safely modify mass
             Rocket rocketCopy = (Rocket) document.getRocket().copy();
@@ -225,7 +233,7 @@ public class SimulationEngine {
             ensureManualAtmosphereHasValues(sim.getOptions());
 
             configureMonteCarloSimulationOptions(sim.getOptions());
-            data.add(new SimulationData(sim));
+            runs.add(new RunEntry(sim));
         }
     }
 
@@ -241,10 +249,10 @@ public class SimulationEngine {
             windLevel.setSpeed(windSpeed);
             log.debug("Cond @ {}: Avg WindSpeed: {}m/s", windLevel.getAltitude(), windSpeed);
 
-            // FIX: direction is already radians; windDirStdDev is radians.
-            double windDirectionRad = randomGauss(windLevel.getDirection(), windDirStdDevRad);
-            windLevel.setDirection(wrapRadians(windDirectionRad));
-            log.debug("Cond @ {}: windDirection: {} rad", windLevel.getAltitude(), windDirectionRad);
+            // Waterloo-style: vary direction in degrees, then set radians
+            double windDirectionDeg = randomGauss(Math.toDegrees(windLevel.getDirection()), windDirStdDevDeg);
+            windLevel.setDirection(Math.toRadians(windDirectionDeg));
+            log.debug("Cond @ {}: windDirection: {}degrees", windLevel.getAltitude(), windDirectionDeg);
         }
 
         // FIX: keep manual atmosphere values physical when ISA is off.
@@ -309,18 +317,19 @@ public class SimulationEngine {
      * @return list of simulations
      */
     public List<Simulation> getSimulations(int start, int size) {
-        return data.stream().skip(start).limit(size).map(SimulationData::getSimulation).toList();
+        return runs.stream().skip(start).limit(size).map(r -> r.simulation).toList();
     }
 
     public List<SimulationData> getData() {
-        return data;
+        return runs.stream().map(r -> r.data).filter(d -> d != null).toList();
     }
 
     public void processSimulationData() {
-        for (SimulationData d : data) {
+        for (RunEntry r : runs) {
             try {
-                if (!d.hasData() && d.getSimulation().hasSimulationData()) // only process unprocessed simulations
-                    d.processData(keepSimulationObject);
+                if (r.data == null && r.simulation.hasSimulationData()) {
+                    r.data = SimulationData.fromSimulation(r.simulation, 0);
+                }
             } catch (Exception e) {
                 log.error(e.getMessage());
             }
@@ -328,83 +337,73 @@ public class SimulationEngine {
     }
 
     public void summarizeSimulations() {
-        Statistics.Sample apogee = Statistics.calculateSample(
-                data.stream().map(SimulationData::getApogee).map((v) -> v * FEET_METRES).collect(Collectors.toList()));
-        double minStability = data.stream().mapToDouble(x -> x.getMinStability().get(0)).min().orElseThrow();
-        double maxStability = data.stream().mapToDouble(x -> x.getMaxStability().get(0)).max().orElseThrow();
-        Statistics.Sample initStability = Statistics.calculateSample(
-                data.stream().map(x -> x.getInitStability().get(0)).collect(Collectors.toList()));
-        double lowInitStabilityPercentage = (double) data.stream().mapToDouble(x -> x.getInitStability().get(0))
-                .filter((stability) -> stability < 1.5).count() / data.size();
-        Statistics.Sample apogeeStability = Statistics.calculateSample(
-                data.stream().map(x -> x.getApogeeStability().get(0)).collect(Collectors.toList()));
-        Statistics.Sample maxMach = Statistics.calculateSample(
-                data.stream().map(SimulationData::getMaxMachNumber).collect(Collectors.toList()));
+        List<SimulationData> results = getData();
+        if (results.size() < 2) {
+            log.warn("Not enough processed data to summarize (need >= 2).");
+            return;
+        }
 
-        log.info("Data over {} runs:", simulationCount);
-        log.info("Apogee (ft): {}", apogee);
-        log.info("Max mach number: {}", maxMach);
-        log.info("Min stability: {}", minStability);
-        log.info("Max stability: {}", maxStability);
-        log.info("Apogee stability: {}", apogeeStability);
-        log.info("Initial stability: {}", initStability);
-        log.info("Percentage of initial stability less than 1.5: {}", lowInitStabilityPercentage);
+        List<Double> apogeeFeet = results.stream()
+                .filter(d -> d.hasApogee)
+                .map(d -> d.apogee_m * FEET_METRES)
+                .collect(Collectors.toList());
 
-//        return data.stream().sorted(Comparator.comparing(x -> x.getMinStability().get(0)))
-//                .limit(5).toList();
+        if (apogeeFeet.size() >= 2) {
+            Statistics.Sample apogee = Statistics.calculateSample(apogeeFeet);
+            log.info("Apogee (ft): {}", apogee);
+        } else {
+            log.warn("Not enough apogee samples for statistics.");
+        }
+
+        List<Double> landingEast = results.stream()
+                .filter(d -> d.hasLanding)
+                .map(d -> d.landingEast_m)
+                .collect(Collectors.toList());
+
+        List<Double> landingNorth = results.stream()
+                .filter(d -> d.hasLanding)
+                .map(d -> d.landingNorth_m)
+                .collect(Collectors.toList());
+
+        if (landingEast.size() >= 2 && landingNorth.size() >= 2) {
+            Statistics.Sample east = Statistics.calculateSample(landingEast);
+            Statistics.Sample north = Statistics.calculateSample(landingNorth);
+            log.info("Landing East (m): {}", east);
+            log.info("Landing North (m): {}", north);
+        } else {
+            log.warn("Not enough landing samples for statistics.");
+        }
     }
 
     public void exportToCSV(File csvFile) {
-        if (data.isEmpty()) {
+        List<SimulationData> results = getData();
+        if (results.isEmpty()) {
             log.warn("No data has been generated, ignoring CSV export");
             return;
         }
-        // Write all simulation data to CSV
         try (BufferedWriter writer = new BufferedWriter(new FileWriter(csvFile))) {
-            // Write comprehensive header
-            StringBuilder header = new StringBuilder("Simulation,Max Windspeed (mph),Wind Direction (deg),Temperature (°C),Pressure (mbar),Apogee (ft),Max Mach");
-
-            // add branch-specific headers
-            String[] branchHeaders =
-                    {"Initial Stability", "Min Stability", "Max Stability", "Apogee Stability", "Landing Latitude (deg N)",
-                            "Landing Longitude (deg E)", "Position East of Launch (ft)", "Position North of Launch (ft)",
-                            "Lateral Velocity at Apogee (m/s)"};
-            int branches = data.get(0).getBranchName().size();
-            for (int i = 0; i < branches; i++) {
-                String branchName = data.get(0).getBranchName().get(i);
-                StringBuilder branchHeader = new StringBuilder();
-                for (String branchHeaderLabel : branchHeaders) {
-                    branchHeader.append(",").append(branchName).append(" ").append(branchHeaderLabel);
-                }
-                header.append(branchHeader);
-            }
-            header.append("\n");
+            StringBuilder header = new StringBuilder(
+                    "Simulation,Apogee (m),Apogee Time (s),Landing Time (s)," +
+                    "Landing East (m),Landing North (m),Landing Lat (deg),Landing Lon (deg)," +
+                    "Landing Downrange (m),Landing Crossrange (m),Has Apogee,Has Landing\n"
+            );
 
             writer.write(header.toString());
 
-            // Write data for each simulation
-            for (SimulationData simData : data) {
+            for (SimulationData simData : results) {
                 StringBuilder row = new StringBuilder();
-                row.append(simData.getName()).append(",");
-                row.append(simData.getMaxWindSpeedInMPH()).append(",");
-                row.append(simData.getMaxWindDirectionInDegrees()).append(",");
-                row.append(simData.getTemperatureInCelsius()).append(",");
-                row.append(simData.getPressureInMBar()).append(",");
-                row.append(simData.getApogeeInFeet()).append(",");
-                row.append(simData.getMaxMachNumber()).append(",");
-
-                for (int i = 0; i < branches; i++) { // branch-specific data
-                    row.append(simData.getInitStability().get(i)).append(",");
-                    row.append(simData.getMinStability().get(i)).append(",");
-                    row.append(simData.getMaxStability().get(i)).append(",");
-                    row.append(simData.getApogeeStability().get(i)).append(",");
-                    row.append(simData.getLandingLatitude().get(i)).append(",");
-                    row.append(simData.getLandingLongitude().get(i)).append(",");
-                    row.append(simData.getEastPostLandingInFeet().get(i)).append(",");
-                    row.append(simData.getNorthPostLandingInFeet().get(i)).append(",");
-                    row.append(simData.getApogeeLateralVelocity().get(i)).append(",");
-                }
-                row.append("\n");
+                row.append(simData.simulationName).append(",");
+                row.append(simData.apogee_m).append(",");
+                row.append(simData.apogeeTime_s).append(",");
+                row.append(simData.landingTime_s).append(",");
+                row.append(simData.landingEast_m).append(",");
+                row.append(simData.landingNorth_m).append(",");
+                row.append(simData.landingLat_deg).append(",");
+                row.append(simData.landingLon_deg).append(",");
+                row.append(simData.landingDownrange_m).append(",");
+                row.append(simData.landingCrossrange_m).append(",");
+                row.append(simData.hasApogee).append(",");
+                row.append(simData.hasLanding).append("\n");
                 writer.write(row.toString());
             }
         } catch (IOException e) {

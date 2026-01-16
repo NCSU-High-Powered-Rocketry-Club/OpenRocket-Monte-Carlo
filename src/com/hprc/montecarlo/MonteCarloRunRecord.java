@@ -48,6 +48,11 @@ public final class MonteCarloRunRecord {
     // Outputs (from SimulationData)
     public final SimulationData results;
 
+    private double landingEastM = Double.NaN;
+    private double landingNorthM = Double.NaN;
+    private double landingLatDeg = Double.NaN;
+    private double landingLonDeg = Double.NaN;
+
     public MonteCarloRunRecord(
             int runIndex,
             String simulationName,
@@ -84,4 +89,14 @@ public final class MonteCarloRunRecord {
 
         this.results = results;
     }
+
+    public double getLandingEastM() { return landingEastM; }
+    public double getLandingNorthM() { return landingNorthM; }
+    public double getLandingLatDeg() { return landingLatDeg; }
+    public double getLandingLonDeg() { return landingLonDeg; }
+
+    public void setLandingEastM(double v) { this.landingEastM = v; }
+    public void setLandingNorthM(double v) { this.landingNorthM = v; }
+    public void setLandingLatDeg(double v) { this.landingLatDeg = v; }
+    public void setLandingLonDeg(double v) { this.landingLonDeg = v; }
 }
