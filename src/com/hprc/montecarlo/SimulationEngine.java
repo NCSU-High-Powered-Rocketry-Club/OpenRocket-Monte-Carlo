@@ -29,7 +29,6 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.stream.Collectors;
-import info.openrocket.core.rocketcomponent.Rocket;
 
 /**
  * The main class that is run
@@ -49,6 +48,7 @@ public class SimulationEngine {
     private final static int CSV_SIMULATION_COLUMN_COUNT = 2; // skip the date column
     private final static int CSV_WIND_LEVEL_COLUMN_COUNT = 3;
     private static final double FEET_METRES = 3.28084;
+    
     /**
      * How many simulations we should run
      */
@@ -67,7 +67,8 @@ public class SimulationEngine {
         }
     }
 
-    private double windDirStdDevDeg, tempStdDev, pressureStdDev;
+    // Updated to match Old Code variable naming
+    private double windDirStdDev, tempStdDev, pressureStdDev;
 
     private static final double DEFAULT_T0_K = 288.15;      // 15 C
     private static final double DEFAULT_P0_PA = 101325.0;   // sea-level standard
@@ -102,11 +103,6 @@ public class SimulationEngine {
      * @param document OpenRocket document to be used with the simulation
      * @param csvFile  CSV file that specifies simulation conditions
      * @throws Exception On CSV parse fail
-     * @see SimulationEngine#CSV_SIMULATION_UNITS
-     * @see SimulationEngine#CSV_WIND_LEVEL_UNITS
-     * @see SimulationEngine#CSV_ALTITUDE_UNIT
-     * @see SimulationEngine#CSV_SIMULATION_COLUMN_COUNT
-     * @see SimulationEngine#CSV_WIND_LEVEL_COLUMN_COUNT
      */
     SimulationEngine(OpenRocketDocument document, File csvFile) throws Exception {
         this.document = document;
@@ -145,13 +141,10 @@ public class SimulationEngine {
                 MultiLevelPinkNoiseWindModel windModel = simulation.getOptions().getMultiLevelWindModel();
                 for (int i = 0; i < altitudes.size(); i++) {
                     windModel.addWindLevel(altitudes.get(i),
-                            simData[2 + i * CSV_WIND_LEVEL_COLUMN_COUNT],
-                            simData[2 + i * CSV_WIND_LEVEL_COLUMN_COUNT + 2],
-                            simData[2 + i * CSV_WIND_LEVEL_COLUMN_COUNT + 1]);
+                            simData[2 + i * CSV_WIND_LEVEL_COLUMN_COUNT],     // Speed
+                            simData[2 + i * CSV_WIND_LEVEL_COLUMN_COUNT + 2], // Direction
+                            simData[2 + i * CSV_WIND_LEVEL_COLUMN_COUNT + 1]);// StDev
                 }
-
-                SimulationData simulationData = null;
-                log.debug(simulationData.toString());
 
                 runs.add(new RunEntry(simulation));
             }
@@ -165,16 +158,15 @@ public class SimulationEngine {
      *
      * @param document        OpenRocket document to be used with the simulation
      * @param simulationCount Number of simulations
-     * @param windDirStdDev   Wind direction standard deviation
+     * @param windDirStdDev   Wind direction standard deviation (Degrees)
      * @param tempStdDev      Temperature standard deviation
      * @param pressureStdDev  Pressure standard deviation
-     * @see SimulationEngine#createMonteCarloSimulations(Simulation)
      */
     SimulationEngine(OpenRocketDocument document, int simulationCount,
-                     double windDirStdDevDeg, double tempStdDev, double pressureStdDev) {
+                     double windDirStdDev, double tempStdDev, double pressureStdDev) {
         this.document = document;
         this.simulationCount = simulationCount;
-        this.windDirStdDevDeg = windDirStdDevDeg;
+        this.windDirStdDev = windDirStdDev;
         this.tempStdDev = tempStdDev;
         this.pressureStdDev = pressureStdDev;
     }
@@ -195,7 +187,6 @@ public class SimulationEngine {
         }
     }
 
-
     /**
      * Choose a random number from a Gaussian distribution with a given mean and standard deviation
      *
@@ -211,14 +202,14 @@ public class SimulationEngine {
      *
      * @param referenceSim Reference simulation to copy base conditions, extensions from
      * @implNote Clears existing simulations
-     * @see SimulationEngine#configureMonteCarloSimulationOptions(SimulationOptions)
      */
     public void createMonteCarloSimulations(Simulation referenceSim) {
         runs.clear();
         for (int i = 0; i < simulationCount; i++) {
-            // CLONE the rocket so MonteCarloExtension can safely modify mass
-            Rocket rocketCopy = (Rocket) document.getRocket().copy();
-            Simulation sim = new Simulation(document, rocketCopy);
+            // IMPORTANT: use the document rocket.
+            // Motor selection is tied to FlightConfigurations owned by the document rocket;
+            // simulating with a copied rocket can silently fall back to "[No motors]" and end at t=0.
+            Simulation sim = new Simulation(document, document.getRocket());
             sim.setName("Simulation " + i);
             log.info("Generating conditions for {}", sim.getName());
 
@@ -229,7 +220,6 @@ public class SimulationEngine {
                 sim.getSimulationExtensions().add(c.clone());
             }
 
-            // FIX: if ISA is off, make sure pressure/temp are valid before perturbing.
             ensureManualAtmosphereHasValues(sim.getOptions());
 
             configureMonteCarloSimulationOptions(sim.getOptions());
@@ -245,41 +235,35 @@ public class SimulationEngine {
     private void configureMonteCarloSimulationOptions(SimulationOptions opts) {
 
         for (MultiLevelPinkNoiseWindModel.LevelWindModel windLevel : opts.getMultiLevelWindModel().getLevels()) {
+            // Speed
             double windSpeed = randomGauss(windLevel.getSpeed(), windLevel.getStandardDeviation());
             windLevel.setSpeed(windSpeed);
             log.debug("Cond @ {}: Avg WindSpeed: {}m/s", windLevel.getAltitude(), windSpeed);
 
-            // Waterloo-style: vary direction in degrees, then set radians
-            double windDirectionDeg = randomGauss(Math.toDegrees(windLevel.getDirection()), windDirStdDevDeg);
-            windLevel.setDirection(Math.toRadians(windDirectionDeg));
-            log.debug("Cond @ {}: windDirection: {}degrees", windLevel.getAltitude(), windDirectionDeg);
+            // Direction
+            // OpenRocket stores direction in Radians. StdDev is provided in Degrees.
+            // We convert the Mean to Degrees, apply the Gaussian noise (in degrees), then convert back to Radians.
+            double meanDirDeg = Math.toDegrees(windLevel.getDirection());
+            double windDirection = randomGauss(meanDirDeg, windDirStdDev);
+            windLevel.setDirection(Math.toRadians(windDirection));
+            log.debug("Cond @ {}: windDirection: {}degrees", windLevel.getAltitude(), windDirection);
         }
 
-        // FIX: keep manual atmosphere values physical when ISA is off.
-        // (delta C == delta K, so σ in C is fine as σ in K)
         double temperature = randomGauss(opts.getLaunchTemperature(), tempStdDev);
         if (!Double.isFinite(temperature) || temperature <= 0.0) temperature = DEFAULT_T0_K;
         opts.setLaunchTemperature(temperature);
+        log.debug("Cond: Temperature: {}K", temperature);
 
         double pressure = randomGauss(opts.getLaunchPressure(), pressureStdDev);
         if (!Double.isFinite(pressure) || pressure <= 0.0) pressure = DEFAULT_P0_PA;
         opts.setLaunchPressure(pressure);
-    }
-
-    private static double wrapRadians(double a) {
-        // wrap to [-pi, pi)
-        double x = a;
-        while (x >= Math.PI) x -= 2.0 * Math.PI;
-        while (x < -Math.PI) x += 2.0 * Math.PI;
-        return x;
+        log.debug("Cond: Pressure: {}Pa", pressure);
     }
 
     /**
-     * Generates a reference simulation with default values. Use createMonteCarloSimulations to create
-     * Monte-Carlo simulations based on this reference simulation.
+     * Generates a reference simulation with default values.
      *
      * @return Reference simulation with default values
-     * @see SimulationEngine#createMonteCarloSimulations(Simulation)
      */
     public Simulation generateDefaultSimulation() {
         Simulation defaultSimulation = new Simulation(document, document.getRocket());
@@ -290,7 +274,6 @@ public class SimulationEngine {
         opts.setLaunchLongitude(config.getLaunchLongitude());
         opts.setLaunchAltitude(config.getLaunchAltitude());
 
-        // Keep your intended behavior (ISA off), but ensure manual values are not left at 0.
         opts.setISAAtmosphere(false);
         ensureManualAtmosphereHasValues(opts);
 
@@ -304,7 +287,6 @@ public class SimulationEngine {
 
         opts.setGeodeticComputation(GeodeticComputationStrategy.WGS84);
         opts.setMaxSimulationTime(config.getMaxSimulationTime());
-
 
         return defaultSimulation;
     }
@@ -417,11 +399,6 @@ public class SimulationEngine {
 
     /**
      * Runs the provided simulations in parallel using a fixed thread pool.
-     * This executes the OpenRocket simulation in-process (no GUI dialog).
-     *
-     * @param sims     simulations to run
-     * @param threads  number of worker threads (>= 1)
-     * @param listener optional progress callback (may be called from worker threads)
      */
     public void runSimulationsInParallel(List<Simulation> sims, int threads, SimulationProgressListener listener) throws Exception {
         if (sims == null || sims.isEmpty()) return;
@@ -463,4 +440,5 @@ public class SimulationEngine {
             pool.shutdownNow();
         }
     }
+
 }

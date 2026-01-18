@@ -14,6 +14,8 @@ import java.util.List;
  */
 public final class MonteCarloCsvExporter {
 
+    private static final double FEET_PER_M = 3.28084;
+
     private MonteCarloCsvExporter() {}
 
     public static void exportDetailedCsv(File file, List<MonteCarloRunRecord> records) throws IOException {
@@ -32,18 +34,17 @@ public final class MonteCarloCsvExporter {
                   .append("launch_rod_angle_deg,launch_rod_direction_deg,")
                   .append("temperature_C,pressure_mbar,");
 
-            // Wind level columns
             for (int i = 0; i < maxWindLevels; i++) {
                 int n = i + 1;
                 header.append("wind_level_").append(n).append("_alt_m,")
                       .append("wind_level_").append(n).append("_speed_mps,")
                       .append("wind_level_").append(n).append("_speed_mph,")
                       .append("wind_level_").append(n).append("_dir_deg,")
-                      .append("wind_level_").append(n).append("_std_mps,");
+                      .append("wind_level_").append(n).append("_std_mps,")
+                      .append("wind_level_").append(n).append("_turb_intensity,");
             }
 
-            // Outputs from updated SimulationData
-            header.append("apogee_m,apogee_time_s,landing_time_s,")
+            header.append("apogee_m,apogee_ft,apogee_time_s,landing_time_s,")
                   .append("landing_east_m,landing_north_m,landing_lat_deg,landing_lon_deg,")
                   .append("landing_downrange_m,landing_crossrange_m,has_apogee,has_landing");
 
@@ -70,7 +71,6 @@ public final class MonteCarloCsvExporter {
                    .append(UnitGroup.UNITS_TEMPERATURE.getUnit(Chars.DEGREE + "C").toUnit(r.launchTemperatureK)).append(",")
                    .append(UnitGroup.UNITS_PRESSURE.getUnit("mbar").toUnit(r.launchPressurePa)).append(",");
 
-                // wind levels (pad missing)
                 for (int i = 0; i < maxWindLevels; i++) {
                     if (i < r.windLevels.size()) {
                         MonteCarloRunRecord.WindLevel wl = r.windLevels.get(i);
@@ -81,13 +81,15 @@ public final class MonteCarloCsvExporter {
                            .append(wl.speedMps).append(",")
                            .append(mph).append(",")
                            .append(dirDeg).append(",")
-                           .append(wl.stdDevMps).append(",");
+                           .append(wl.stdDevMps).append(",")
+                           .append(wl.turbIntensity).append(",");
                     } else {
-                        row.append(",,,,,"); // 5 columns
+                        row.append(",,,,,,"); // 6 columns
                     }
                 }
 
                 row.append(d.apogee_m).append(",")
+                   .append(d.apogee_m * FEET_PER_M).append(",")
                    .append(d.apogeeTime_s).append(",")
                    .append(d.landingTime_s).append(",")
                    .append(d.landingEast_m).append(",")

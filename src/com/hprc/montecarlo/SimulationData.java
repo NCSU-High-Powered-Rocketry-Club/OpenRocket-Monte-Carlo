@@ -6,6 +6,8 @@ import info.openrocket.core.simulation.FlightDataBranch;
 import info.openrocket.core.simulation.FlightDataType;
 import info.openrocket.core.simulation.FlightEvent;
 import info.openrocket.core.simulation.SimulationOptions;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.List;
 
@@ -24,6 +26,8 @@ import java.util.List;
  * Output feeds MonteCarloRunRecord and LandingDispersion6DOF.
  */
 public final class SimulationData {
+
+    private static final Logger log = LoggerFactory.getLogger(SimulationData.class);
 
     // ---------------------------------------------------------------------------
     // Fields stored per run
@@ -77,6 +81,7 @@ public final class SimulationData {
 
         // 2) Pull flight branch data
         if (!sim.hasSimulationData()) {
+            log.error("Simulation '{}' has no data; this means the simulation failed to run or crashed.", sim.getName());
             throw new IllegalStateException("Simulation '" + sim.getName() + "' has no data; run simulation first.");
         }
 
@@ -85,15 +90,18 @@ public final class SimulationData {
 
         // 3) Extract time series arrays needed
         List<Double> time = branch.get(FlightDataType.TYPE_TIME);
-        List<Double> altitude = branch.get(FlightDataType.TYPE_ALTITUDE); // meters
-        List<Double> posX = branch.get(FlightDataType.TYPE_POSITION_X);   // meters (Downrange)
-        List<Double> posY = branch.get(FlightDataType.TYPE_POSITION_Y);   // meters (Crossrange)
+        List<Double> altitude = branch.get(FlightDataType.TYPE_ALTITUDE);
+        List<Double> posX = branch.get(FlightDataType.TYPE_POSITION_X);
+        List<Double> posY = branch.get(FlightDataType.TYPE_POSITION_Y);
 
         // Validate lengths
         int n = min(time.size(), altitude.size(), posX.size(), posY.size());
         if (n <= 0) {
+            log.error("Flight data arrays empty for simulation '{}'. This indicates the simulation crashed immediately.", sim.getName());
             throw new IllegalStateException("Flight data arrays empty for simulation: " + sim.getName());
         }
+
+        log.debug("Simulation '{}': {} data points collected", sim.getName(), n);
 
         // 4) Determine apogee time
         // Prefer event timestamp if present; fallback to argmax(altitude)

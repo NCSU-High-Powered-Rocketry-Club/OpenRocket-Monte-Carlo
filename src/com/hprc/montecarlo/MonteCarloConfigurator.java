@@ -98,9 +98,6 @@ public class MonteCarloConfigurator
 
         panel.add(sectionLabel("Atmosphere / Wind variation"), "span 3, growx");
 
-        addVelocityStdDev(panel, "Wind speed σ",
-                ext.getWindSpeedStdDev(), ext::setWindSpeedStdDev);
-
         // Optional average wind speed override
         JCheckBox useAvgWind = new JCheckBox("Use average wind speed", ext.isUseAverageWindSpeed());
         panel.add(useAvgWind, "span 3, wrap");
@@ -141,18 +138,9 @@ public class MonteCarloConfigurator
 
         panel.add(sectionLabel("Vehicle / Initial conditions"), "span 3, growx");
 
-        panel.add(new JLabel("Mass variation σ (%)"), "align label");
-        JSpinner massPct = new JSpinner(new SpinnerNumberModel(ext.getMassStdDevPercent(), 0.0, 100.0, 0.1));
-        massPct.setEditor(new SpinnerEditor(massPct));
-        massPct.addChangeListener(e -> ext.setMassStdDevPercent(((Number) massPct.getValue()).doubleValue()));
-        panel.add(massPct, "span 2, growx");
-
-        addVelocityStdDev(panel, "Initial velocity σ",
-                ext.getInitialVelocityStdDev(), ext::setInitialVelocityStdDev);
-
         panel.add(note(
-                        "Note: Some items (mass/initial velocity) require deeper OpenRocket API hooks.\n" +
-                        "This panel stores them now; applying them is handled in MonteCarloExtension.initialize()."
+                        "Note: Initial velocity requires deeper OpenRocket API hooks.\n" +
+                        "This panel stores the value now; applying it is handled in MonteCarloExtension.initialize()."
                 ),
                 "span 3, growx");
 

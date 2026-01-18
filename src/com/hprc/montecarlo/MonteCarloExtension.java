@@ -1,15 +1,10 @@
 package com.hprc.montecarlo;
 
 import info.openrocket.core.models.wind.MultiLevelPinkNoiseWindModel;
-import info.openrocket.core.simulation.SimulationOptions;
 import info.openrocket.core.simulation.SimulationConditions;
+import info.openrocket.core.simulation.SimulationOptions;
 import info.openrocket.core.simulation.exception.SimulationException;
 import info.openrocket.core.simulation.extension.AbstractSimulationExtension;
-import info.openrocket.core.rocketcomponent.Rocket;
-import info.openrocket.core.rocketcomponent.RocketComponent;
-import info.openrocket.core.simulation.SimulationStatus;
-import info.openrocket.core.simulation.listeners.AbstractSimulationListener;
-import info.openrocket.core.util.Coordinate;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -51,32 +46,26 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
     private double launchLatitudeStdDevDeg = 0.0;
     private double launchLongitudeStdDevDeg = 0.0;
     private double launchAltitudeStdDevM = 0.0;
-
     // Atmosphere / wind variation
-    private double windSpeedStdDev = 0.0;          // m/s (UnitSelector can display mph etc)
     private double windDirectionStdDevDeg = 0.0;   // degrees
     private double temperatureStdDevC = 0.0;       // degC (delta == delta K)
     private double pressureStdDevMbar = 0.0;       // mbar (1 mbar = 100 Pa)
 
-    // NEW: optional average wind speed override
+    // Optional average wind speed override
     private boolean useAverageWindSpeed = false;
     private double averageWindSpeedMps = 0.0;      // m/s
 
-    // Vehicle / initial state (may require deeper hooks depending on OR API)
-    private double massStdDevPercent = 0.0;        // %
-    private double initialVelocityStdDev = 0.0;    // m/s
-
     // Batch execution (JVM threads)
     private int workerThreads = 1;
-
-    // Cache baseline masses to restore when σ=0 (or when overrides persist across runs)
-    private final java.util.IdentityHashMap<RocketComponent, Double> baseMassCache = new java.util.IdentityHashMap<>();
 
     @Override
     public void initialize(final SimulationConditions conditions) throws SimulationException {
         if (!enabled) return;
 
+        // Resolve options (some fields still live in SimulationOptions in 24.12)
         SimulationOptions opts = resolveOptions(conditions);
+
+        // RNG
         Random rng = useDeterministicSeed ? new Random(randomSeed) : new Random();
 
         // If user wants manual pressure/temp variation, ensure ISA is disabled AND manual fields are valid.
@@ -127,219 +116,141 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
             opts.setLaunchAltitude(varied);
         }
 
-        // --- Wind model: vary each wind level ---
-        if (opts.getMultiLevelWindModel() != null) {
-            for (MultiLevelPinkNoiseWindModel.LevelWindModel level : opts.getMultiLevelWindModel().getLevels()) {
+        // ---------------------------------------------------------------------
+        // WIND (Waterloo-style)
+        //
+        // Goal: match Waterloo Rocketry's approach:
+        //  - Do NOT vary rocket mass (no mass overrides) or initial velocity.
+        //  - Wind speed variation comes from the WIND MODEL itself:
+        //      * Average model: use the model's own wind-speed std dev (if present)
+        //      * MultiLevel model: for each level, use level.getStandardDeviation()
+        //  - Wind direction variation is applied as a global sigma (this extension),
+        //    in degrees, converted to radians internally.
+        //
+        // IMPORTANT (OR 24.12): the active wind model often lives on SimulationConditions,
+        // not the SimulationOptions object. Always resolve and mutate the ACTIVE model.
+        // ---------------------------------------------------------------------
 
-                // speed in m/s
-                if (useAverageWindSpeed) {
-                    double base = Math.max(0.0, averageWindSpeedMps);
-                    double varied = base;
-                    if (windSpeedStdDev > 0) {
-                        varied = base + rng.nextGaussian() * windSpeedStdDev;
+        final String windModelType = resolveWindModelType(conditions, opts);
+        final boolean isAverageWindModel = (windModelType != null) && windModelType.toLowerCase().contains("average");
+
+        if (isAverageWindModel) {
+            // Prefer setting values on SimulationConditions (24.12); fallback to opts setters if needed
+            Object windTarget = hasMethod(conditions, "setWindSpeed", double.class) ? conditions : opts;
+
+            // Mean speed: either override value or current model value
+            double baseSpeed = useAverageWindSpeed ? Math.max(0.0, averageWindSpeedMps)
+                    : invokeDouble(conditions, "getWindSpeed", invokeDouble(opts, "getWindSpeed", 0.0));
+
+            // Sigma speed: read from the model/conditions if available (no plugin-specific wind-speed sigma)
+            double sigmaSpeed = invokeDouble(conditions, "getWindStandardDeviation", Double.NaN);
+            if (!Double.isFinite(sigmaSpeed)) {
+                sigmaSpeed = invokeDouble(conditions, "getWindSpeedStandardDeviation", Double.NaN);
+            }
+            if (!Double.isFinite(sigmaSpeed)) {
+                sigmaSpeed = invokeDouble(opts, "getWindStandardDeviation", Double.NaN);
+            }
+            if (!Double.isFinite(sigmaSpeed)) {
+                sigmaSpeed = invokeDouble(opts, "getWindSpeedStandardDeviation", 0.0);
+            }
+            if (!Double.isFinite(sigmaSpeed) || sigmaSpeed < 0.0) sigmaSpeed = 0.0;
+
+            double variedSpeed = baseSpeed;
+            if (sigmaSpeed > 0.0) {
+                variedSpeed = Math.max(0.0, baseSpeed + rng.nextGaussian() * sigmaSpeed);
+            }
+
+            // Even if sigma=0, still apply override if enabled (avoid falling back to 2.0 m/s defaults)
+            if (useAverageWindSpeed || sigmaSpeed > 0.0) {
+                invokeVoidDouble(windTarget, "setWindSpeed", variedSpeed);
+                if (debugEnabled) {
+                    log.debug("MC Average wind speed: base={} m/s, σ(model)={} m/s, varied={} m/s (target={})",
+                            baseSpeed, sigmaSpeed, variedSpeed, windTarget.getClass().getSimpleName());
+                }
+            }
+
+            // Direction perturbation (direction is stored in radians internally)
+            if (windDirectionStdDevDeg > 0.0) {
+                double baseDirRad = invokeDouble(conditions, "getWindDirection",
+                        invokeDouble(opts, "getWindDirection", 0.0));
+
+                double variedDeg = Math.toDegrees(baseDirRad) + rng.nextGaussian() * windDirectionStdDevDeg;
+                double variedRad = Math.toRadians(variedDeg);
+
+                invokeVoidDouble(windTarget, "setWindDirection", variedRad);
+
+                if (debugEnabled) {
+                    log.debug("MC Average wind direction: base={} deg, σ={} deg, varied={} deg (target={})",
+                            Math.toDegrees(baseDirRad), windDirectionStdDevDeg, variedDeg, windTarget.getClass().getSimpleName());
+                }
+            }
+
+        } else {
+            // --- Wind model: MultiLevel ---
+            MultiLevelPinkNoiseWindModel ml = resolveMultiLevelWindModel(conditions, opts);
+            if (ml != null) {
+                final double sigmaDirRad = Math.toRadians(windDirectionStdDevDeg);
+
+                for (MultiLevelPinkNoiseWindModel.LevelWindModel level : ml.getLevels()) {
+                    // Speed in m/s: use per-level sigma (Waterloo-style)
+                    double sigma = level.getStandardDeviation();
+                    if (Double.isFinite(sigma) && sigma > 0.0) {
+                        double base = level.getSpeed();
+                        double varied = base + rng.nextGaussian() * sigma;
                         if (varied < 0.0) varied = 0.0;
-                    }
-                    level.setSpeed(varied);
-
-                    if (debugEnabled) {
-                        log.debug("MC wind speed (avg override): base={} m/s, σ={} m/s, varied={} m/s",
-                                base, windSpeedStdDev, varied);
-                    }
-                } else {
-                    if (windSpeedStdDev > 0) {
-                        double base = level.getSpeed();          // current sim’s wind speed (m/s)
-                        double varied = base + rng.nextGaussian() * windSpeedStdDev;
-                        if (varied < 0.0) varied = 0.0;           // keep physical
                         level.setSpeed(varied);
 
                         if (debugEnabled) {
-                            log.debug("MC wind speed: base={} m/s, σ={} m/s, varied={} m/s", base, windSpeedStdDev, varied);
+                            log.debug("MC Wind @ {} m: baseSpeed={} m/s, σ(level)={} m/s, variedSpeed={} m/s",
+                                    level.getAltitude(), base, sigma, varied);
                         }
                     }
-                }
 
-                // Waterloo-style: vary direction in degrees, then set radians
-                if (windDirectionStdDevDeg > 0) {
-                    double baseDeg = Math.toDegrees(level.getDirection());
-                    double variedDeg = baseDeg + rng.nextGaussian() * windDirectionStdDevDeg;
-                    level.setDirection(Math.toRadians(variedDeg));
+                    // Direction in radians
+                    if (windDirectionStdDevDeg > 0.0) {
+                        double baseDir = level.getDirection();
+                        double variedDir = baseDir + rng.nextGaussian() * sigmaDirRad;
+                        level.setDirection(variedDir);
+
+                        if (debugEnabled) {
+                            log.debug("MC Wind @ {} m: baseDir={} deg, σ={} deg, variedDir={} deg",
+                                    level.getAltitude(), Math.toDegrees(baseDir), windDirectionStdDevDeg, Math.toDegrees(variedDir));
+                        }
+                    }
                 }
             }
         }
 
         // --- Temperature/pressure at launch ---
-        if (temperatureStdDevC > 0) {
+        if (temperatureStdDevC > 0.0) {
             double baseK = opts.getLaunchTemperature();
             if (!Double.isFinite(baseK) || baseK <= 0.0) baseK = DEFAULT_T0_K;
 
-            // clamp to something physically sane (tweak bounds for your use case)
-            double sigmaK = clamp(temperatureStdDevC, 0.0, 50.0);     // e.g., <= 50°C sigma
+            // clamp to something physically sane
+            double sigmaK = clamp(temperatureStdDevC, 0.0, 50.0);
             double variedK = baseK + rng.nextGaussian() * sigmaK;
-            variedK = clamp(variedK, 180.0, 330.0);                   // e.g., -93°C to +57°C
+            variedK = clamp(variedK, 180.0, 330.0);
 
             opts.setLaunchTemperature(variedK);
         }
 
-        if (pressureStdDevMbar > 0) {
+        if (pressureStdDevMbar > 0.0) {
             double basePa = opts.getLaunchPressure();
             if (!Double.isFinite(basePa) || basePa <= 0.0) basePa = DEFAULT_P0_PA;
 
-            double sigmaMbar = clamp(pressureStdDevMbar, 0.0, 200.0); // e.g., <= 200 mbar sigma
+            double sigmaMbar = clamp(pressureStdDevMbar, 0.0, 200.0);
             double variedPa = basePa + rng.nextGaussian() * (sigmaMbar * 100.0);
-            variedPa = clamp(variedPa, 50_000.0, 120_000.0);          // e.g., ~500–1200 mbar
+            variedPa = clamp(variedPa, 50_000.0, 120_000.0);
 
             opts.setLaunchPressure(variedPa);
         }
 
-        // --- Initial Velocity (via SimulationListener) ---
-        if (initialVelocityStdDev > 0) {
-            // Draw from N(0, sigma) to preserve the requested standard deviation
-            final double injectedVelocity = rng.nextGaussian() * initialVelocityStdDev;
-
-            conditions.getSimulationListenerList().add(new AbstractSimulationListener() {
-                @Override
-                public void startSimulation(SimulationStatus status) {
-                    try {
-                        Coordinate current = status.getRocketVelocity();
-
-                        // Add along +Z; if you later want rod-aligned, project accordingly.
-                        Coordinate newVel = current.add(new Coordinate(0, 0, injectedVelocity));
-
-                        status.setRocketVelocity(newVel);
-
-                        if (debugEnabled) {
-                            log.debug("MC applied: injected initial velocity {} m/s", injectedVelocity);
-                        }
-                    } catch (Exception e) {
-                        log.warn("Failed to inject initial velocity", e);
-                    }
-                }
-            });
-        }
-
-        // --- Mass Variation ---
-        // IMPORTANT: always clear existing mass overrides first.
-        Rocket rocket = conditions.getRocket();
-        cacheBaseMassesRecursive(rocket);
-        clearMassOverridesRecursive(rocket);
-
-        if (massStdDevPercent > 0) {
-            double r = massStdDevPercent / 100.0;
-
-            // Mean=1, stddev=r (relative). Clamp only to keep physical (>0).
-            double factor = 1.0 + rng.nextGaussian() * r;
-            factor = clamp(factor, 1e-6, 100.0);
-
-            applyMassMultiplier(rocket, factor);
-
-            if (debugEnabled) {
-                log.debug("MC applied: mass σ={}%, multiplier={}", massStdDevPercent, factor);
-            }
-        } else {
-            if (debugEnabled) {
-                log.debug("MC applied: mass σ=0%, cleared any previous mass overrides");
-            }
-        }
-
-        // Ensure overrides do not persist across runs (even if API lacks clear/toggle)
-        conditions.getSimulationListenerList().add(new AbstractSimulationListener() {
-        });
-    }
-
-    /**
-     * Draws a strictly-positive multiplicative factor with mean 1 and relative stddev = r.
-     *
-     * For r = 0, returns exactly 1.
-     */
-    // private static double drawLogNormalMultiplierMeanOne(double r, Random rng) {
-    //     if (!(r > 0.0) || !Double.isFinite(r)) {
-    //         return 1.0;
-    //     }
-
-    //     // s^2 = ln(1 + r^2), mu = -s^2/2 ensures mean = 1
-    //     double s2 = Math.log1p(r * r);
-    //     double s = Math.sqrt(s2);
-    //     double mu = -0.5 * s2;
-
-    //     double z = rng.nextGaussian();
-    //     double factor = Math.exp(mu + s * z);
-
-    //     // ultra-defensive guard
-    //     if (!Double.isFinite(factor) || factor <= 0.0) return 1.0;
-    //     return factor;
-    // }
-
-    /**
-     * Recursively scales the mass of the component and all its children.
-     */
-    private void applyMassMultiplier(RocketComponent component, double factor) {
-        // getComponentMass() returns the mass of THIS component (including material), excluding children.
-        double originalMass = component.getComponentMass();
-        if (originalMass > 0 && Double.isFinite(originalMass) && Double.isFinite(factor) && factor > 0) {
-            component.setOverrideMass(originalMass * factor);
-            // Some OR versions have an explicit toggle; enable if available.
-            tryInvokeBooleanSetter(component, "setMassOverridden", true);
-        }
-
-        for (RocketComponent child : component.getChildren()) {
-            applyMassMultiplier(child, factor);
-        }
-    }
-
-    private void cacheBaseMassesRecursive(RocketComponent component) {
-        if (component == null) return;
-        baseMassCache.putIfAbsent(component, component.getComponentMass());
-        for (RocketComponent child : component.getChildren()) {
-            cacheBaseMassesRecursive(child);
-        }
-    }
-
-    /**
-     * Clears any per-component mass override so a σ=0 run truly uses the base rocket mass.
-     * Uses reflection to tolerate OpenRocket API differences.
-     */
-    private void clearMassOverridesRecursive(RocketComponent component) {
-        if (component == null) return;
-
-        // Restore baseline mass if we have it (guards against stuck overrides)
-        Double baseline = baseMassCache.get(component);
-        if (baseline != null && Double.isFinite(baseline) && baseline > 0) {
-            tryInvokeDoubleSetter(component, "setOverrideMass", baseline);
-        }
-
-        // Newer OR: clearOverrideMass()
-        try {
-            Method m = component.getClass().getMethod("clearOverrideMass");
-            m.invoke(component);
-        } catch (Exception ignored) {
-            // Older OR: setMassOverridden(false) (or similar)
-            tryInvokeBooleanSetter(component, "setMassOverridden", false);
-
-            // Another variant seen in forks: setOverrideMassEnabled(false)
-            tryInvokeBooleanSetter(component, "setOverrideMassEnabled", false);
-        }
-
-        for (RocketComponent child : component.getChildren()) {
-            clearMassOverridesRecursive(child);
-        }
-    }
-
-    private static void tryInvokeBooleanSetter(Object target, String methodName, boolean value) {
-        try {
-            Method m = target.getClass().getMethod(methodName, boolean.class);
-            m.invoke(target, value);
-        } catch (Exception ignored) {
-            // method may not exist in this OR version
-        }
-    }
-
-    private static void tryInvokeDoubleSetter(Object target, String methodName, double value) {
-        try {
-            Method m = target.getClass().getMethod(methodName, double.class);
-            m.invoke(target, value);
-        } catch (Exception ignored) {
-            // method may not exist in this OR version
-        }
+        // NOTE:
+        // Do NOT call Simulation.setOptions(...) or Simulation.copySimulationOptionsFrom(...) from here.
+        // In OR 24.12, SimulationConditions/SimulationOptions are tightly coupled to the active
+        // FlightConfiguration (motor selection). For some builds, re-copying options at this stage can
+        // cause OpenRocket to re-validate and fall back to "[No motors]", which ends the simulation at t=0.
+        // We only mutate the live SimulationConditions / Options objects that OpenRocket provides.
     }
 
     // -------------------------------------------------------------------------
@@ -368,12 +279,94 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
         throw new SimulationException("Cannot resolve SimulationOptions from SimulationConditions in this OpenRocket version.");
     }
 
+    // (intentionally no "sync back" helper; see note above)
+
+    // -------------------------------------------------------------------------
+    // Wind helpers (24.12-safe: avoid compile-time dependency on wind model enums)
+    // -------------------------------------------------------------------------
+
+    private static String resolveWindModelType(SimulationConditions conditions, SimulationOptions opts) {
+        // Prefer conditions.getWindModel()
+        Object wm = invokeObject(conditions, "getWindModel");
+        if (wm != null) return wm.toString();
+
+        // Fallbacks
+        Object wmt = invokeObject(conditions, "getWindModelType");
+        if (wmt != null) return wmt.toString();
+
+        Object wm2 = invokeObject(opts, "getWindModel");
+        if (wm2 != null) return wm2.toString();
+
+        Object wmt2 = invokeObject(opts, "getWindModelType");
+        if (wmt2 != null) return wmt2.toString();
+
+        return "";
+    }
+
+    private static MultiLevelPinkNoiseWindModel resolveMultiLevelWindModel(SimulationConditions conditions, SimulationOptions opts) {
+        // Prefer conditions.getMultiLevelWindModel()
+        Object maybe = invokeObject(conditions, "getMultiLevelWindModel");
+        if (maybe instanceof MultiLevelPinkNoiseWindModel ml) return ml;
+
+        // Fallback to opts.getMultiLevelWindModel()
+        try {
+            return opts.getMultiLevelWindModel();
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static Object invokeObject(Object target, String methodName) {
+        if (target == null) return null;
+        try {
+            Method m = target.getClass().getMethod(methodName);
+            return m.invoke(target);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private static double invokeDouble(Object target, String methodName, double fallback) {
+        if (target == null) return fallback;
+        try {
+            Method m = target.getClass().getMethod(methodName);
+            Object v = m.invoke(target);
+            if (v instanceof Number n) return n.doubleValue();
+            return fallback;
+        } catch (Exception ignored) {
+            return fallback;
+        }
+    }
+
+    private static void invokeVoidDouble(Object target, String methodName, double value) {
+        if (target == null) return;
+        try {
+            Method m = target.getClass().getMethod(methodName, double.class);
+            m.invoke(target, value);
+        } catch (Exception ignored) {
+            // Not available in this build / target
+        }
+    }
+
+    private static boolean hasMethod(Object target, String methodName, Class<?>... params) {
+        if (target == null) return false;
+        try {
+            target.getClass().getMethod(methodName, params);
+            return true;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Utility
+    // -------------------------------------------------------------------------
+
     private static double clamp(double v, double lo, double hi) {
         return Math.max(lo, Math.min(hi, v));
     }
 
     private static double wrapLongitudeDeg(double lon) {
-        // wrap to [-180, 180)
         double x = lon;
         while (x >= 180.0) x -= 360.0;
         while (x < -180.0) x += 360.0;
@@ -427,11 +420,6 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
 
     public double getLaunchAltitudeStdDevM() { return launchAltitudeStdDevM; }
     public void setLaunchAltitudeStdDevM(double v) { launchAltitudeStdDevM = Math.max(0.0, finiteOrZero(v)); fireChangeEvent(); }
-
-    public double getWindSpeedStdDev() { return windSpeedStdDev; }
-    public void setWindSpeedStdDev(double v) { windSpeedStdDev = Math.max(0.0, finiteOrZero(v)); fireChangeEvent(); }
-
-    // NEW: average wind speed toggle + value
     public boolean isUseAverageWindSpeed() { return useAverageWindSpeed; }
     public void setUseAverageWindSpeed(boolean v) { useAverageWindSpeed = v; fireChangeEvent(); }
 
@@ -446,20 +434,8 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
 
     public double getPressureStdDevMbar() { return pressureStdDevMbar; }
     public void setPressureStdDevMbar(double v) { pressureStdDevMbar = Math.max(0.0, finiteOrZero(v)); fireChangeEvent(); }
-
-    public double getMassStdDevPercent() { return massStdDevPercent; }
-    public void setMassStdDevPercent(double v) { massStdDevPercent = clamp(finiteOrZero(v), 0.0, 100.0); fireChangeEvent(); }
-
-    public double getInitialVelocityStdDev() { return initialVelocityStdDev; }
-    public void setInitialVelocityStdDev(double v) { initialVelocityStdDev = Math.max(0.0, finiteOrZero(v)); fireChangeEvent(); }
-
-    public int getWorkerThreads() {
-        return workerThreads;
-    }
-
-    public void setWorkerThreads(int workerThreads) {
-        this.workerThreads = Math.max(1, workerThreads);
-    }
+    public int getWorkerThreads() { return workerThreads; }
+    public void setWorkerThreads(int workerThreads) { this.workerThreads = Math.max(1, workerThreads); }
 
     private static double finiteOrZero(double v) {
         return Double.isFinite(v) ? v : 0.0;

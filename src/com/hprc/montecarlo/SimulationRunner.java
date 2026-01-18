@@ -19,30 +19,50 @@ public final class SimulationRunner {
     private SimulationRunner() { }
 
     public static void runSimulationInProcess(Simulation sim) throws Exception {
-        // 1) Try simulate(SimulationListener... listeners) (common OR API)
+        if (sim == null) throw new IllegalArgumentException("sim is null");
+
+        // IMPORTANT:
+        // Prefer no-arg simulate() when it exists.
+        // Simulation Extensions (AbstractSimulationExtension.initialize) are typically
+        // wired into the normal simulation entry-point. Some OR builds also expose
+        // simulate(SimulationListener... listeners); calling that overload can skip
+        // the SimulationExtension pipeline depending on version.
+        try {
+            Method m = sim.getClass().getMethod("simulate");
+            if (m.getParameterCount() == 0) {
+                m.invoke(sim);
+                return;
+            }
+        } catch (NoSuchMethodException ignored) {
+            // fall through
+        }
+
+        // Fallback: simulate(SimulationListener... listeners)
+        // Pass empty listener array so OR can still attach its own extension listeners.
         try {
             for (Method m : sim.getClass().getMethods()) {
                 if (!m.getName().equals("simulate")) continue;
-
                 Class<?>[] params = m.getParameterTypes();
-                if (params.length == 1 && params[0].isArray()) {
-                    Object emptyListeners = java.lang.reflect.Array.newInstance(params[0].getComponentType(), 0);
-                    m.invoke(sim, emptyListeners);
-                    return;
-                }
+                if (params.length != 1) continue;
+                if (!params[0].isArray()) continue;
+
+                Object emptyListeners = java.lang.reflect.Array.newInstance(params[0].getComponentType(), 0);
+                m.invoke(sim, emptyListeners);
+                return;
             }
         } catch (Exception ignored) {
             // fall through
         }
 
-        // 2) Try no-arg fallbacks seen in some versions/forks
-        String[] candidates = { "simulate", "runSimulation", "run" };
+        // Other no-arg fallbacks for forks/older builds
+        String[] candidates = { "runSimulation", "run" };
         for (String name : candidates) {
             try {
                 Method m = sim.getClass().getMethod(name);
                 m.invoke(sim);
                 return;
             } catch (NoSuchMethodException ignored) {
+                // keep trying
             }
         }
 
@@ -56,11 +76,11 @@ public final class SimulationRunner {
     /**
      * How to interpret FlightDataType.TYPE_POSITION_X/Y
      *
-     * In many OpenRocket builds, X/Y are NOT true East/North; they’re downrange/crossrange
+     * In many OpenRocket builds, X/Y are NOT true East/North; they're downrange/crossrange
      * in the launch-azimuth frame (especially when Launch Into Wind is enabled).
      *
      * If you treat X/Y as East/North when they are downrange/crossrange, you will get
-     * “all points on a line” behavior.
+     * "all points on a line" behavior.
      */
     public enum XYFrame {
         /** X=East, Y=North (rarely what you want if Launch Into Wind is enabled). */
@@ -142,7 +162,7 @@ public final class SimulationRunner {
     /**
      * Extract landing (impact) location from an already-simulated Simulation.
      *
-     * This is the “filled out” version of your pseudocode:
+     * This is the "filled out" version of your pseudocode:
      *   FlightDataBranch branch = simResult.getFlightData().getBranch(0);
      *   double x = branch.getLast(TYPE_POSITION_X);
      *   double y = branch.getLast(TYPE_POSITION_Y);
