@@ -36,7 +36,7 @@ public class Main {
          *   java -cp <your.jar> com.hprc.montecarlo.Main dispersion <args...>
          *
          * If LandingDispersion6DOF still has a main(String[]), we will invoke it.
-         * If not, we’ll just print a message (so this file won’t break your build).
+         * If not, we'll just print a message (so this file won't break your build).
          */
         if (args != null && args.length > 0 && "dispersion".equalsIgnoreCase(args[0])) {
             runDispersionCliIfPresent(args);

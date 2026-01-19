@@ -78,8 +78,12 @@ public final class MonteCarloBatchRunner {
             MonteCarloExtension mc = findMonteCarloExtension(s);
             long seedUsed = 0L;
             boolean det = false;
+            double windSpeedAverageSigmaMps = 0.0;
+            double windSpeedTurbulenceSigmaMps = 0.0;
             if (mc != null) {
                 det = mc.isUseDeterministicSeed();
+                windSpeedAverageSigmaMps = mc.getWindSpeedAverageSigmaMps();
+                windSpeedTurbulenceSigmaMps = mc.getWindSpeedTurbulenceSigmaMps();
                 if (det) {
                     seedUsed = mc.getRandomSeed() + i;
                     mc.setRandomSeed(seedUsed);
@@ -96,7 +100,9 @@ public final class MonteCarloBatchRunner {
             SimulationData data = SimulationData.fromSimulation(s, 0);
 
             SimulationOptions opts = s.getOptions();
-            MonteCarloRunRecord rec = new MonteCarloRunRecord(runIndex, s.getName(), det, seedUsed, opts, data);
+            MonteCarloRunRecord rec = new MonteCarloRunRecord(runIndex, s.getName(), det, seedUsed,
+                    windSpeedAverageSigmaMps, windSpeedTurbulenceSigmaMps,
+                    opts, data);
             rec.setLandingEastM(data.landingEast_m);
             rec.setLandingNorthM(data.landingNorth_m);
             rec.setLandingLatDeg(data.landingLat_deg);
@@ -174,8 +180,12 @@ public final class MonteCarloBatchRunner {
                     MonteCarloExtension mc = findMonteCarloExtension(s);
                     long seedUsed = 0L;
                     boolean det = false;
+                    double windSpeedAverageSigmaMps = 0.0;
+                    double windSpeedTurbulenceSigmaMps = 0.0;
                     if (mc != null) {
                         det = mc.isUseDeterministicSeed();
+                        windSpeedAverageSigmaMps = mc.getWindSpeedAverageSigmaMps();
+                        windSpeedTurbulenceSigmaMps = mc.getWindSpeedTurbulenceSigmaMps();
                         if (det) {
                             seedUsed = mc.getRandomSeed() + runZeroBased;
                             mc.setRandomSeed(seedUsed);
@@ -193,7 +203,9 @@ public final class MonteCarloBatchRunner {
                         SimulationData data = SimulationData.fromSimulation(s, 0);
 
                         SimulationOptions opts = s.getOptions();
-                        MonteCarloRunRecord rec = new MonteCarloRunRecord(runIndex, s.getName(), det, seedUsed, opts, data);
+                        MonteCarloRunRecord rec = new MonteCarloRunRecord(runIndex, s.getName(), det, seedUsed,
+                                windSpeedAverageSigmaMps, windSpeedTurbulenceSigmaMps,
+                                opts, data);
                         rec.setLandingEastM(data.landingEast_m);
                         rec.setLandingNorthM(data.landingNorth_m);
                         rec.setLandingLatDeg(data.landingLat_deg);

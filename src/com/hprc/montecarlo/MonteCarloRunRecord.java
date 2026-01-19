@@ -46,6 +46,10 @@ public final class MonteCarloRunRecord {
     public final double launchTemperatureK;
     public final double launchPressurePa;
 
+    // Wind sigmas configured for this run (plugin settings)
+    public final double windSpeedAverageSigmaMps;
+    public final double windSpeedTurbulenceSigmaMps;
+
     // Wind model type string (e.g., "Average", "MultiLevel", etc.)
     public final String windModelType;
     public final List<WindLevel> windLevels = new ArrayList<>();
@@ -63,6 +67,8 @@ public final class MonteCarloRunRecord {
             String simulationName,
             boolean deterministicSeed,
             long seedUsed,
+            double windSpeedAverageSigmaMps,
+            double windSpeedTurbulenceSigmaMps,
             SimulationOptions opts,
             SimulationData results
     ) {
@@ -70,6 +76,9 @@ public final class MonteCarloRunRecord {
         this.simulationName = simulationName;
         this.deterministicSeed = deterministicSeed;
         this.seedUsed = seedUsed;
+
+        this.windSpeedAverageSigmaMps = windSpeedAverageSigmaMps;
+        this.windSpeedTurbulenceSigmaMps = windSpeedTurbulenceSigmaMps;
 
         this.launchLatitudeDeg = opts.getLaunchLatitude();
         this.launchLongitudeDeg = opts.getLaunchLongitude();
@@ -108,7 +117,7 @@ public final class MonteCarloRunRecord {
         SimulationConditions cond = getConditions(opts);
         if (cond != null) {
             Object windModelObj = invokeObject(cond, "getWindModel");
-            if (windModelObj != null) return windModelObj.toString();
+            if (windModelObj != null) return windModelObj.getClass().getSimpleName();
 
             // Some builds expose "getWindModelType"
             Object windModelTypeObj = invokeObject(cond, "getWindModelType");
@@ -117,7 +126,7 @@ public final class MonteCarloRunRecord {
 
         // Fallbacks if conditions not available / different API
         Object windModelObj2 = invokeObject(opts, "getWindModel");
-        if (windModelObj2 != null) return windModelObj2.toString();
+        if (windModelObj2 != null) return windModelObj2.getClass().getSimpleName();
 
         Object windModelTypeObj2 = invokeObject(opts, "getWindModelType");
         if (windModelTypeObj2 != null) return windModelTypeObj2.toString();
@@ -128,40 +137,18 @@ public final class MonteCarloRunRecord {
     private static void populateWindLevels(SimulationOptions opts, String windModelType, List<WindLevel> out) {
         if (opts == null || out == null) return;
 
-        SimulationConditions cond = getConditions(opts);
+        final SimulationConditions cond = getConditions(opts);
+        Object windModel = (cond != null) ? invokeObject(cond, "getWindModel") : null;
+        if (windModel == null) windModel = invokeObject(opts, "getWindModel");
 
-        // ---- Average model: read scalar wind fields from conditions first (OR 24.12), then fallback to opts ----
-        if (windModelType != null && windModelType.toLowerCase().contains("average")) {
-            Object src = (cond != null) ? cond : opts;
-
-            double speed = invokeDouble(src, "getWindSpeed", Double.NaN);
-            double dirRad = invokeDouble(src, "getWindDirection", Double.NaN);
-            double std = invokeDouble(src, "getWindStandardDeviation", Double.NaN);
-
-            // Some builds may name std dev differently
-            if (!Double.isFinite(std)) {
-                std = invokeDouble(src, "getWindSpeedStandardDeviation", Double.NaN);
-            }
-
-            if (Double.isFinite(speed) && Double.isFinite(dirRad)) {
-                if (!Double.isFinite(std)) std = 0.0;
-                double turb = invokeDouble(src, "getWindTurbulenceIntensity", Double.NaN);
-                if (!Double.isFinite(turb)) {
-                    turb = invokeDouble(src, "getWindTurbulence", Double.NaN);
-                }
-                out.add(new WindLevel(0.0, speed, dirRad, std, turb));
-                return;
-            }
-        }
-
-        // ---- MultiLevel model: MultiLevelPinkNoiseWindModel may live on conditions or options depending on build ----
+        // ---- Multi-level wind model (preferred) ----
         MultiLevelPinkNoiseWindModel ml = null;
-
-        if (cond != null) {
+        if (windModel instanceof MultiLevelPinkNoiseWindModel) {
+            ml = (MultiLevelPinkNoiseWindModel) windModel;
+        }
+        if (ml == null && cond != null) {
             Object maybe = invokeObject(cond, "getMultiLevelWindModel");
-            if (maybe instanceof MultiLevelPinkNoiseWindModel) {
-                ml = (MultiLevelPinkNoiseWindModel) maybe;
-            }
+            if (maybe instanceof MultiLevelPinkNoiseWindModel) ml = (MultiLevelPinkNoiseWindModel) maybe;
         }
         if (ml == null) {
             try { ml = opts.getMultiLevelWindModel(); } catch (Throwable ignored) { }
@@ -170,9 +157,7 @@ public final class MonteCarloRunRecord {
         if (ml != null) {
             for (MultiLevelPinkNoiseWindModel.LevelWindModel lvl : ml.getLevels()) {
                 double turb = invokeDouble(lvl, "getTurbulenceIntensity", Double.NaN);
-                if (!Double.isFinite(turb)) {
-                    turb = invokeDouble(lvl, "getTurbulence", Double.NaN);
-                }
+                if (!Double.isFinite(turb)) turb = invokeDouble(lvl, "getTurbulence", Double.NaN);
                 out.add(new WindLevel(
                         lvl.getAltitude(),
                         lvl.getSpeed(),
@@ -181,7 +166,48 @@ public final class MonteCarloRunRecord {
                         turb
                 ));
             }
+            return;
         }
+
+        // ---- Scalar wind model (PinkNoise, Average, etc.) ----
+        final Object src = (cond != null) ? cond : opts;
+
+        double speed = Double.NaN;
+        if (windModel != null) {
+            speed = invokeDouble(windModel, "getWindSpeed", Double.NaN);
+            if (!Double.isFinite(speed)) speed = invokeDouble(windModel, "getSpeed", Double.NaN);
+            if (!Double.isFinite(speed)) speed = invokeDouble(windModel, "getAverageWindSpeed", Double.NaN);
+        }
+        if (!Double.isFinite(speed)) speed = invokeDouble(src, "getWindSpeed", Double.NaN);
+        if (!Double.isFinite(speed) || speed < 0.0) speed = 0.0;
+
+        double dirRad = Double.NaN;
+        if (windModel != null) {
+            dirRad = invokeDouble(windModel, "getWindDirection", Double.NaN);
+            if (!Double.isFinite(dirRad)) dirRad = invokeDouble(windModel, "getDirection", Double.NaN);
+        }
+        if (!Double.isFinite(dirRad)) dirRad = invokeDouble(src, "getWindDirection", Double.NaN);
+        if (!Double.isFinite(dirRad)) dirRad = 0.0;
+
+        double std = Double.NaN;
+        if (windModel != null) {
+            std = invokeDouble(windModel, "getWindStandardDeviation", Double.NaN);
+            if (!Double.isFinite(std)) std = invokeDouble(windModel, "getWindSpeedStandardDeviation", Double.NaN);
+            if (!Double.isFinite(std)) std = invokeDouble(windModel, "getStandardDeviation", Double.NaN);
+        }
+        if (!Double.isFinite(std)) std = invokeDouble(src, "getWindStandardDeviation", Double.NaN);
+        if (!Double.isFinite(std)) std = invokeDouble(src, "getWindSpeedStandardDeviation", Double.NaN);
+        if (!Double.isFinite(std) || std < 0.0) std = 0.0;
+
+        double turb = Double.NaN;
+        if (windModel != null) {
+            turb = invokeDouble(windModel, "getTurbulenceIntensity", Double.NaN);
+            if (!Double.isFinite(turb)) turb = invokeDouble(windModel, "getWindTurbulenceIntensity", Double.NaN);
+        }
+        if (!Double.isFinite(turb)) turb = invokeDouble(src, "getWindTurbulenceIntensity", Double.NaN);
+        if (!Double.isFinite(turb)) turb = invokeDouble(src, "getWindTurbulence", Double.NaN);
+
+        out.add(new WindLevel(0.0, speed, dirRad, std, turb));
     }
 
     private static SimulationConditions getConditions(SimulationOptions opts) {

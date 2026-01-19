@@ -51,9 +51,11 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
     private double temperatureStdDevC = 0.0;       // degC (delta == delta K)
     private double pressureStdDevMbar = 0.0;       // mbar (1 mbar = 100 Pa)
 
-    // Optional average wind speed override
-    private boolean useAverageWindSpeed = false;
-    private double averageWindSpeedMps = 0.0;      // m/s
+    // Wind speed variation controls
+    // - windSpeedAverageSigmaMps: perturbs the MEAN wind speed per Monte Carlo run
+    // - windSpeedTurbulenceSigmaMps: sets the wind model's internal turbulence/gust std dev
+    private double windSpeedAverageSigmaMps = 0.0;     // m/s
+    private double windSpeedTurbulenceSigmaMps = 0.0;  // m/s
 
     // Batch execution (JVM threads)
     private int workerThreads = 1;
@@ -131,92 +133,101 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
         // not the SimulationOptions object. Always resolve and mutate the ACTIVE model.
         // ---------------------------------------------------------------------
 
-        final String windModelType = resolveWindModelType(conditions, opts);
-        final boolean isAverageWindModel = (windModelType != null) && windModelType.toLowerCase().contains("average");
+        // Wind model object (often owned by SimulationConditions in OR 24.12)
+        final Object windModel = resolveWindModel(conditions, opts);
+        MultiLevelPinkNoiseWindModel ml = resolveMultiLevelWindModel(conditions, opts);
 
-        if (isAverageWindModel) {
-            // Prefer setting values on SimulationConditions (24.12); fallback to opts setters if needed
-            Object windTarget = hasMethod(conditions, "setWindSpeed", double.class) ? conditions : opts;
+        final double avgSigmaMps = Math.max(0.0, finiteOrZero(windSpeedAverageSigmaMps));
+        final double turbSigmaMps = Math.max(0.0, finiteOrZero(windSpeedTurbulenceSigmaMps));
+        final double dirSigmaRad = Math.toRadians(Math.max(0.0, finiteOrZero(windDirectionStdDevDeg)));
 
-            // Mean speed: either override value or current model value
-            double baseSpeed = useAverageWindSpeed ? Math.max(0.0, averageWindSpeedMps)
-                    : invokeDouble(conditions, "getWindSpeed", invokeDouble(opts, "getWindSpeed", 0.0));
+        if (ml != null) {
+            // -----------------------------
+            // Multi-level wind profile
+            // -----------------------------
 
-            // Sigma speed: read from the model/conditions if available (no plugin-specific wind-speed sigma)
-            double sigmaSpeed = invokeDouble(conditions, "getWindStandardDeviation", Double.NaN);
-            if (!Double.isFinite(sigmaSpeed)) {
-                sigmaSpeed = invokeDouble(conditions, "getWindSpeedStandardDeviation", Double.NaN);
-            }
-            if (!Double.isFinite(sigmaSpeed)) {
-                sigmaSpeed = invokeDouble(opts, "getWindStandardDeviation", Double.NaN);
-            }
-            if (!Double.isFinite(sigmaSpeed)) {
-                sigmaSpeed = invokeDouble(opts, "getWindSpeedStandardDeviation", 0.0);
-            }
-            if (!Double.isFinite(sigmaSpeed) || sigmaSpeed < 0.0) sigmaSpeed = 0.0;
-
-            double variedSpeed = baseSpeed;
-            if (sigmaSpeed > 0.0) {
-                variedSpeed = Math.max(0.0, baseSpeed + rng.nextGaussian() * sigmaSpeed);
-            }
-
-            // Even if sigma=0, still apply override if enabled (avoid falling back to 2.0 m/s defaults)
-            if (useAverageWindSpeed || sigmaSpeed > 0.0) {
-                invokeVoidDouble(windTarget, "setWindSpeed", variedSpeed);
-                if (debugEnabled) {
-                    log.debug("MC Average wind speed: base={} m/s, σ(model)={} m/s, varied={} m/s (target={})",
-                            baseSpeed, sigmaSpeed, variedSpeed, windTarget.getClass().getSimpleName());
+            // A) Mean wind speed variation: shift ALL levels by the same delta for this run.
+            if (avgSigmaMps > 0.0) {
+                final double delta = rng.nextGaussian() * avgSigmaMps;
+                for (MultiLevelPinkNoiseWindModel.LevelWindModel level : ml.getLevels()) {
+                    double base = level.getSpeed();
+                    double varied = Math.max(0.0, base + delta);
+                    level.setSpeed(varied);
+                    if (debugEnabled) {
+                        log.debug("MC Wind(mean) @ {} m: baseSpeed={} m/s, sigmaMean={} m/s, variedSpeed={} m/s",
+                                level.getAltitude(), base, avgSigmaMps, varied);
+                    }
                 }
             }
 
-            // Direction perturbation (direction is stored in radians internally)
-            if (windDirectionStdDevDeg > 0.0) {
-                double baseDirRad = invokeDouble(conditions, "getWindDirection",
-                        invokeDouble(opts, "getWindDirection", 0.0));
-
-                double variedDeg = Math.toDegrees(baseDirRad) + rng.nextGaussian() * windDirectionStdDevDeg;
-                double variedRad = Math.toRadians(variedDeg);
-
-                invokeVoidDouble(windTarget, "setWindDirection", variedRad);
-
+            // B) Turbulence std dev: set per-level standard deviation.
+            if (turbSigmaMps > 0.0) {
+                for (MultiLevelPinkNoiseWindModel.LevelWindModel level : ml.getLevels()) {
+                    try {
+                        level.setStandardDeviation(turbSigmaMps);
+                    } catch (Throwable ignored) {
+                    }
+                }
                 if (debugEnabled) {
-                    log.debug("MC Average wind direction: base={} deg, σ={} deg, varied={} deg (target={})",
-                            Math.toDegrees(baseDirRad), windDirectionStdDevDeg, variedDeg, windTarget.getClass().getSimpleName());
+                    log.debug("MC Wind(turbulence): set per-level standard deviation to {} m/s", turbSigmaMps);
+                }
+            }
+
+            // Direction perturbation (per-level)
+            if (dirSigmaRad > 0.0) {
+                for (MultiLevelPinkNoiseWindModel.LevelWindModel level : ml.getLevels()) {
+                    double baseDir = level.getDirection();
+                    double variedDir = baseDir + rng.nextGaussian() * dirSigmaRad;
+                    level.setDirection(variedDir);
+                    if (debugEnabled) {
+                        log.debug("MC Wind(dir) @ {} m: baseDir={} deg, sigmaDir={} deg, variedDir={} deg",
+                                level.getAltitude(), Math.toDegrees(baseDir), windDirectionStdDevDeg, Math.toDegrees(variedDir));
+                    }
                 }
             }
 
         } else {
-            // --- Wind model: MultiLevel ---
-            MultiLevelPinkNoiseWindModel ml = resolveMultiLevelWindModel(conditions, opts);
-            if (ml != null) {
-                final double sigmaDirRad = Math.toRadians(windDirectionStdDevDeg);
+            // -----------------------------
+            // Scalar wind model (PinkNoise / Average / others)
+            // -----------------------------
 
-                for (MultiLevelPinkNoiseWindModel.LevelWindModel level : ml.getLevels()) {
-                    // Speed in m/s: use per-level sigma (Waterloo-style)
-                    double sigma = level.getStandardDeviation();
-                    if (Double.isFinite(sigma) && sigma > 0.0) {
-                        double base = level.getSpeed();
-                        double varied = base + rng.nextGaussian() * sigma;
-                        if (varied < 0.0) varied = 0.0;
-                        level.setSpeed(varied);
+            // Prefer setting values on SimulationConditions (24.12); fallback to opts setters if needed
+            final Object windTarget = hasMethod(conditions, "setWindSpeed", double.class) ? conditions : opts;
 
-                        if (debugEnabled) {
-                            log.debug("MC Wind @ {} m: baseSpeed={} m/s, σ(level)={} m/s, variedSpeed={} m/s",
-                                    level.getAltitude(), base, sigma, varied);
-                        }
-                    }
+            // A) Mean wind speed variation (per-run)
+            if (avgSigmaMps > 0.0) {
+                double baseSpeed = getScalarWindSpeedMps(conditions, opts, windModel);
+                double variedSpeed = Math.max(0.0, baseSpeed + rng.nextGaussian() * avgSigmaMps);
+                invokeVoidDouble(windTarget, "setWindSpeed", variedSpeed);
+                applyScalarWindSpeedToModel(windModel, variedSpeed);
+                if (debugEnabled) {
+                    log.debug("MC Wind(mean): baseSpeed={} m/s, sigmaMean={} m/s, variedSpeed={} m/s (target={})",
+                            baseSpeed, avgSigmaMps, variedSpeed, windTarget.getClass().getSimpleName());
+                }
+            }
 
-                    // Direction in radians
-                    if (windDirectionStdDevDeg > 0.0) {
-                        double baseDir = level.getDirection();
-                        double variedDir = baseDir + rng.nextGaussian() * sigmaDirRad;
-                        level.setDirection(variedDir);
+            // B) Turbulence std dev (gust-style)
+            if (turbSigmaMps > 0.0) {
+                boolean set = tryInvokeVoidDouble(windTarget, "setWindStandardDeviation", turbSigmaMps);
+                if (!set) {
+                    set = tryInvokeVoidDouble(windTarget, "setWindSpeedStandardDeviation", turbSigmaMps);
+                }
+                applyScalarWindStdDevToModel(windModel, turbSigmaMps);
+                if (debugEnabled) {
+                    log.debug("MC Wind(turbulence): set sigmaTurb={} m/s (target={}, setOnTarget={})",
+                            turbSigmaMps, windTarget.getClass().getSimpleName(), set);
+                }
+            }
 
-                        if (debugEnabled) {
-                            log.debug("MC Wind @ {} m: baseDir={} deg, σ={} deg, variedDir={} deg",
-                                    level.getAltitude(), Math.toDegrees(baseDir), windDirectionStdDevDeg, Math.toDegrees(variedDir));
-                        }
-                    }
+            // Direction perturbation (direction stored in radians)
+            if (dirSigmaRad > 0.0) {
+                double baseDirRad = getScalarWindDirectionRad(conditions, opts, windModel);
+                double variedDir = baseDirRad + rng.nextGaussian() * dirSigmaRad;
+                invokeVoidDouble(windTarget, "setWindDirection", variedDir);
+                applyScalarWindDirectionToModel(windModel, variedDir);
+                if (debugEnabled) {
+                    log.debug("MC Wind(dir): baseDir={} deg, sigmaDir={} deg, variedDir={} deg (target={})",
+                            Math.toDegrees(baseDirRad), windDirectionStdDevDeg, Math.toDegrees(variedDir), windTarget.getClass().getSimpleName());
                 }
             }
         }
@@ -313,6 +324,68 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
             return opts.getMultiLevelWindModel();
         } catch (Throwable ignored) {
             return null;
+        }
+    }
+
+    /**
+     * Resolve the active wind model object (scalar or multilevel). In OR 24.12 this typically
+     * lives on SimulationConditions, but older builds may expose it on SimulationOptions.
+     */
+    private static Object resolveWindModel(SimulationConditions conditions, SimulationOptions opts) {
+        Object wm = invokeObject(conditions, "getWindModel");
+        if (wm != null) return wm;
+        return invokeObject(opts, "getWindModel");
+    }
+
+    private static double getScalarWindSpeedMps(SimulationConditions conditions, SimulationOptions opts, Object windModel) {
+        double s = invokeDouble(windModel, "getWindSpeed", Double.NaN);
+        if (!Double.isFinite(s)) s = invokeDouble(windModel, "getSpeed", Double.NaN);
+        if (!Double.isFinite(s)) s = invokeDouble(windModel, "getAverageWindSpeed", Double.NaN);
+        if (!Double.isFinite(s)) s = invokeDouble(conditions, "getWindSpeed", Double.NaN);
+        if (!Double.isFinite(s)) s = invokeDouble(opts, "getWindSpeed", Double.NaN);
+        if (!Double.isFinite(s) || s < 0.0) s = 0.0;
+        return s;
+    }
+
+    private static double getScalarWindDirectionRad(SimulationConditions conditions, SimulationOptions opts, Object windModel) {
+        double d = invokeDouble(windModel, "getWindDirection", Double.NaN);
+        if (!Double.isFinite(d)) d = invokeDouble(windModel, "getDirection", Double.NaN);
+        if (!Double.isFinite(d)) d = invokeDouble(conditions, "getWindDirection", Double.NaN);
+        if (!Double.isFinite(d)) d = invokeDouble(opts, "getWindDirection", 0.0);
+        if (!Double.isFinite(d)) d = 0.0;
+        return d;
+    }
+
+    private static void applyScalarWindSpeedToModel(Object windModel, double speedMps) {
+        if (windModel == null) return;
+        if (tryInvokeVoidDouble(windModel, "setWindSpeed", speedMps)) return;
+        if (tryInvokeVoidDouble(windModel, "setSpeed", speedMps)) return;
+        if (tryInvokeVoidDouble(windModel, "setAverageWindSpeed", speedMps)) return;
+        tryInvokeVoidDouble(windModel, "setMeanWindSpeed", speedMps);
+    }
+
+    private static void applyScalarWindDirectionToModel(Object windModel, double dirRad) {
+        if (windModel == null) return;
+        if (tryInvokeVoidDouble(windModel, "setWindDirection", dirRad)) return;
+        tryInvokeVoidDouble(windModel, "setDirection", dirRad);
+    }
+
+    private static void applyScalarWindStdDevToModel(Object windModel, double stdMps) {
+        if (windModel == null) return;
+        if (tryInvokeVoidDouble(windModel, "setWindStandardDeviation", stdMps)) return;
+        if (tryInvokeVoidDouble(windModel, "setWindSpeedStandardDeviation", stdMps)) return;
+        if (tryInvokeVoidDouble(windModel, "setStandardDeviation", stdMps)) return;
+        tryInvokeVoidDouble(windModel, "setStdDev", stdMps);
+    }
+
+    private static boolean tryInvokeVoidDouble(Object target, String methodName, double value) {
+        if (target == null) return false;
+        try {
+            Method m = target.getClass().getMethod(methodName, double.class);
+            m.invoke(target, value);
+            return true;
+        } catch (Exception ignored) {
+            return false;
         }
     }
 
@@ -420,11 +493,19 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
 
     public double getLaunchAltitudeStdDevM() { return launchAltitudeStdDevM; }
     public void setLaunchAltitudeStdDevM(double v) { launchAltitudeStdDevM = Math.max(0.0, finiteOrZero(v)); fireChangeEvent(); }
-    public boolean isUseAverageWindSpeed() { return useAverageWindSpeed; }
-    public void setUseAverageWindSpeed(boolean v) { useAverageWindSpeed = v; fireChangeEvent(); }
 
-    public double getAverageWindSpeedMps() { return averageWindSpeedMps; }
-    public void setAverageWindSpeedMps(double v) { averageWindSpeedMps = Math.max(0.0, finiteOrZero(v)); fireChangeEvent(); }
+    /**
+     * Sigma used to vary the mean wind speed per Monte Carlo run (m/s).
+     * This is intentionally separate from turbulence/gust sigma.
+     */
+    public double getWindSpeedAverageSigmaMps() { return windSpeedAverageSigmaMps; }
+    public void setWindSpeedAverageSigmaMps(double v) { windSpeedAverageSigmaMps = Math.max(0.0, finiteOrZero(v)); fireChangeEvent(); }
+
+    /**
+     * Sigma used to set the wind model's internal turbulence / gust standard deviation (m/s).
+     */
+    public double getWindSpeedTurbulenceSigmaMps() { return windSpeedTurbulenceSigmaMps; }
+    public void setWindSpeedTurbulenceSigmaMps(double v) { windSpeedTurbulenceSigmaMps = Math.max(0.0, finiteOrZero(v)); fireChangeEvent(); }
 
     public double getWindDirectionStdDevDeg() { return windDirectionStdDevDeg; }
     public void setWindDirectionStdDevDeg(double v) { windDirectionStdDevDeg = Math.max(0.0, finiteOrZero(v)); fireChangeEvent(); }

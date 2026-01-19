@@ -98,31 +98,12 @@ public class MonteCarloConfigurator
 
         panel.add(sectionLabel("Atmosphere / Wind variation"), "span 3, growx");
 
-        // Optional average wind speed override
-        JCheckBox useAvgWind = new JCheckBox("Use average wind speed", ext.isUseAverageWindSpeed());
-        panel.add(useAvgWind, "span 3, wrap");
+        // Wind speed sigmas (both are velocities, unit-selectable)
+        addVelocityStdDev(panel, "Wind speed average sigma",
+                ext.getWindSpeedAverageSigmaMps(), ext::setWindSpeedAverageSigmaMps);
 
-        panel.add(new JLabel("Average wind speed"), "align label");
-        DoubleModel avgWindModel = new DoubleModel(ext.getAverageWindSpeedMps(), UnitGroup.UNITS_VELOCITY, 0);
-        JSpinner avgWindSpinner = new JSpinner(avgWindModel.getSpinnerModel());
-        avgWindSpinner.setEditor(new SpinnerEditor(avgWindSpinner));
-        avgWindSpinner.addChangeListener(e -> ext.setAverageWindSpeedMps(avgWindModel.getValue()));
-        UnitSelector avgWindUnit = new UnitSelector(avgWindModel);
-        panel.add(avgWindSpinner, "growx");
-        panel.add(avgWindUnit);
-
-        // enable/disable inputs based on toggle
-        Consumer<Boolean> setAvgEnabled = avgEnabled -> {
-            avgWindSpinner.setEnabled(avgEnabled);
-            avgWindUnit.setEnabled(avgEnabled);
-        };
-
-        setAvgEnabled.accept(ext.isUseAverageWindSpeed());
-        useAvgWind.addActionListener(e -> {
-            boolean on = useAvgWind.isSelected();
-            ext.setUseAverageWindSpeed(on);
-            setAvgEnabled.accept(on);
-        });
+        addVelocityStdDev(panel, "Wind speed turbulence sigma",
+                ext.getWindSpeedTurbulenceSigmaMps(), ext::setWindSpeedTurbulenceSigmaMps);
 
         addAngleStdDev(panel, "Wind direction σ", UnitGroup.UNITS_ANGLE,
                 Math.toRadians(ext.getWindDirectionStdDevDeg()),

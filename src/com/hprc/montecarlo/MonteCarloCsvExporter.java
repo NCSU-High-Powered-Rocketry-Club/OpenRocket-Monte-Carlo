@@ -23,8 +23,9 @@ public final class MonteCarloCsvExporter {
             throw new IOException("No records to export.");
         }
 
-        // Determine max wind level count for column layout
-        int maxWindLevels = records.stream().mapToInt(r -> r.windLevels.size()).max().orElse(0);
+        // Determine max wind level count for column layout (ensure at least 1 for scalar wind models)
+        int maxWindLevels = records.stream().mapToInt(r -> r.windLevels.size()).max().orElse(1);
+        if (maxWindLevels < 1) maxWindLevels = 1;
 
         try (BufferedWriter w = new BufferedWriter(new FileWriter(file))) {
             // Header
@@ -32,7 +33,10 @@ public final class MonteCarloCsvExporter {
             header.append("run_index,simulation_name,deterministic_seed,seed_used,")
                   .append("launch_lat_deg,launch_lon_deg,launch_alt_m,")
                   .append("launch_rod_angle_deg,launch_rod_direction_deg,")
-                  .append("temperature_C,pressure_mbar,");
+                  .append("temperature_C,pressure_mbar,")
+                  .append("wind_model_type,wind_levels_used,")
+                  .append("wind_speed_avg_sigma_mps,wind_speed_avg_sigma_mph,")
+                  .append("wind_speed_turb_sigma_mps,wind_speed_turb_sigma_mph,");
 
             for (int i = 0; i < maxWindLevels; i++) {
                 int n = i + 1;
@@ -69,7 +73,15 @@ public final class MonteCarloCsvExporter {
                    .append(Math.toDegrees(r.launchRodDirectionRad)).append(",")
 
                    .append(UnitGroup.UNITS_TEMPERATURE.getUnit(Chars.DEGREE + "C").toUnit(r.launchTemperatureK)).append(",")
-                   .append(UnitGroup.UNITS_PRESSURE.getUnit("mbar").toUnit(r.launchPressurePa)).append(",");
+                   .append(UnitGroup.UNITS_PRESSURE.getUnit("mbar").toUnit(r.launchPressurePa)).append(",")
+
+                   .append(csv(safe(r.windModelType))).append(",")
+                   .append(r.windLevels.size()).append(",")
+
+                   .append(r.windSpeedAverageSigmaMps).append(",")
+                   .append(UnitGroup.UNITS_VELOCITY.getUnit("mph").toUnit(r.windSpeedAverageSigmaMps)).append(",")
+                   .append(r.windSpeedTurbulenceSigmaMps).append(",")
+                   .append(UnitGroup.UNITS_VELOCITY.getUnit("mph").toUnit(r.windSpeedTurbulenceSigmaMps)).append(",");
 
                 for (int i = 0; i < maxWindLevels; i++) {
                     if (i < r.windLevels.size()) {
