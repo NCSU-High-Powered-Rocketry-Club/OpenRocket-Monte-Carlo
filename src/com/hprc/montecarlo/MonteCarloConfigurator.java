@@ -19,7 +19,6 @@ import java.nio.file.Paths;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.Consumer;
 import java.util.function.DoubleConsumer;
 
 /**
@@ -99,10 +98,10 @@ public class MonteCarloConfigurator
         panel.add(sectionLabel("Atmosphere / Wind variation"), "span 3, growx");
 
         // Wind speed sigmas (both are velocities, unit-selectable)
-        addVelocityStdDev(panel, "Wind speed average sigma",
+        addVelocityStdDev(panel, "Wind speed average σ",
                 ext.getWindSpeedAverageSigmaMps(), ext::setWindSpeedAverageSigmaMps);
 
-        addVelocityStdDev(panel, "Wind speed turbulence sigma",
+        addVelocityStdDev(panel, "Wind speed turbulence σ",
                 ext.getWindSpeedTurbulenceSigmaMps(), ext::setWindSpeedTurbulenceSigmaMps);
 
         addAngleStdDev(panel, "Wind direction σ", UnitGroup.UNITS_ANGLE,
@@ -116,14 +115,6 @@ public class MonteCarloConfigurator
                 ext.getPressureStdDevMbar(), ext::setPressureStdDevMbar);
 
         panel.add(new JSeparator(), "span 3, growx");
-
-        panel.add(sectionLabel("Vehicle / Initial conditions"), "span 3, growx");
-
-        panel.add(note(
-                        "Note: Initial velocity requires deeper OpenRocket API hooks.\n" +
-                        "This panel stores the value now; applying it is handled in MonteCarloExtension.initialize()."
-                ),
-                "span 3, growx");
 
         panel.add(new JSeparator(), "span 3, growx");
         panel.add(sectionLabel("Batch run / Export"), "span 3, growx");

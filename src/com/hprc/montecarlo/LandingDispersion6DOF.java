@@ -78,6 +78,7 @@ public final class LandingDispersion6DOF {
 
         public Ellipse oneSigma;
         public Ellipse twoSigma;
+        public Ellipse threeSigma;
     }
 
     /**
@@ -158,6 +159,7 @@ public final class LandingDispersion6DOF {
             s.cxx = 0; s.cxy = 0; s.cyy = 0;
             s.oneSigma = new Ellipse(0, 0, 0);
             s.twoSigma = new Ellipse(0, 0, 0);
+            s.threeSigma = new Ellipse(0, 0, 0);
             return s;
         }
 
@@ -221,13 +223,14 @@ public final class LandingDispersion6DOF {
         double thetaDeg = Math.toDegrees(thetaRad);
         double bearingDeg = wrap360(90.0 - thetaDeg);
 
-        // 4) 1-sigma and 2-sigma ellipse axis lengths
+        // 4) 1-sigma, 2-sigma and 3-sigma ellipse axis lengths
         // Axis length = sqrt(eigenvalue)
         double a1 = Math.sqrt(Math.max(lambda1, 0.0));
         double b1 = Math.sqrt(Math.max(lambda2, 0.0));
 
         s.oneSigma = new Ellipse(a1, b1, bearingDeg);
         s.twoSigma = new Ellipse(2.0 * a1, 2.0 * b1, bearingDeg);
+        s.threeSigma = new Ellipse(3.0 * a1, 3.0 * b1, bearingDeg);
 
         return s;
     }
@@ -298,18 +301,20 @@ public final class LandingDispersion6DOF {
                          "mean_east_m,mean_north_m," +
                          "cxx,cxy,cyy," +
                          "one_sigma_a_m,one_sigma_b_m,one_sigma_bearing_deg," +
-                         "two_sigma_a_m,two_sigma_b_m,two_sigma_bearing_deg");
+                         "two_sigma_a_m,two_sigma_b_m,two_sigma_bearing_deg," +
+                         "three_sigma_a_m,three_sigma_b_m,three_sigma_bearing_deg");
             writer.newLine();
 
             // Write Data
             String line = String.format(Locale.US,
-                    "%d,%.8f,%.8f,%.8f,%.8f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f",
+                    "%d,%.8f,%.8f,%.8f,%.8f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f",
                     s.n, s.launchLat_deg, s.launchLon_deg,
                     s.meanLat_deg, s.meanLon_deg,
                     s.meanEast_m, s.meanNorth_m,
                     s.cxx, s.cxy, s.cyy,
                     s.oneSigma.a_m, s.oneSigma.b_m, s.oneSigma.bearing_deg,
-                    s.twoSigma.a_m, s.twoSigma.b_m, s.twoSigma.bearing_deg
+                    s.twoSigma.a_m, s.twoSigma.b_m, s.twoSigma.bearing_deg,
+                    s.threeSigma.a_m, s.threeSigma.b_m, s.threeSigma.bearing_deg
             );
             writer.write(line);
             writer.newLine();
@@ -359,6 +364,12 @@ public final class LandingDispersion6DOF {
           .append("    <PolyStyle><color>200000ff</color></PolyStyle>\n")
           .append("  </Style>\n");
 
+        // 3-Sigma Ellipse (Green, Semi-transparent fill)
+        sb.append("  <Style id=\"threeSigmaStyle\">\n")
+          .append("    <LineStyle><color>ff00ff00</color><width>2</width></LineStyle>\n")
+          .append("    <PolyStyle><color>2000ff00</color></PolyStyle>\n")
+          .append("  </Style>\n");
+
         // --- Placemarks ---
 
         // Launch Site
@@ -385,6 +396,14 @@ public final class LandingDispersion6DOF {
             sb.append("  <Placemark>\n    <name>2-Sigma Dispersion</name>\n    <styleUrl>#twoSigmaStyle</styleUrl>\n    <Polygon>\n      <outerBoundaryIs>\n        <LinearRing>\n          <coordinates>\n");
             List<String> twoSigmaCoords = buildEllipseRingLonLat(s, s.twoSigma);
             for (String coord : twoSigmaCoords) {
+                sb.append("            ").append(coord).append("\n");
+            }
+            sb.append("          </coordinates>\n        </LinearRing>\n      </outerBoundaryIs>\n    </Polygon>\n  </Placemark>\n");
+
+            // 3-Sigma Polygon
+            sb.append("  <Placemark>\n    <name>3-Sigma Dispersion</name>\n    <styleUrl>#threeSigmaStyle</styleUrl>\n    <Polygon>\n      <outerBoundaryIs>\n        <LinearRing>\n          <coordinates>\n");
+            List<String> threeSigmaCoords = buildEllipseRingLonLat(s, s.threeSigma);
+            for (String coord : threeSigmaCoords) {
                 sb.append("            ").append(coord).append("\n");
             }
             sb.append("          </coordinates>\n        </LinearRing>\n      </outerBoundaryIs>\n    </Polygon>\n  </Placemark>\n");
@@ -465,9 +484,9 @@ public final class LandingDispersion6DOF {
             }
         }
 
-        if (s != null && s.oneSigma != null && s.twoSigma != null) {
-            double maxA = Math.max(s.oneSigma.a_m, s.twoSigma.a_m);
-            double maxB = Math.max(s.oneSigma.b_m, s.twoSigma.b_m);
+        if (s != null && s.oneSigma != null && s.twoSigma != null && s.threeSigma != null) {
+            double maxA = Math.max(s.threeSigma.a_m, Math.max(s.oneSigma.a_m, s.twoSigma.a_m));
+            double maxB = Math.max(s.threeSigma.b_m, Math.max(s.oneSigma.b_m, s.twoSigma.b_m));
             minE = Math.min(minE, s.meanEast_m - maxA);
             maxE = Math.max(maxE, s.meanEast_m + maxA);
             minN = Math.min(minN, s.meanNorth_m - maxB);
@@ -492,8 +511,9 @@ public final class LandingDispersion6DOF {
             return new Point(x, y);
         };
 
-        // draw ellipses (2-sigma then 1-sigma)
+        // draw ellipses (3-sigma then 2-sigma then 1-sigma)
         if (s != null && s.n >= 2) {
+            drawEllipse(g, s, s.threeSigma, map, new Color(0, 255, 0, 40), new Color(0, 255, 0, 160));
             drawEllipse(g, s, s.twoSigma, map, new Color(255, 0, 0, 50), new Color(255, 0, 0, 180));
             drawEllipse(g, s, s.oneSigma, map, new Color(255, 255, 0, 80), new Color(255, 255, 0, 200));
         }

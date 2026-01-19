@@ -15,9 +15,11 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 
 /**
- * Runs N Monte Carlo simulations sequentially (in-process) and returns per-run records.
+ * Runs N Monte Carlo simulations sequentially or in parallel and returns per-run records.
+ * Optimized for reduced scheduling overhead via chunking.
  */
 public final class MonteCarloBatchRunner {
 
@@ -27,97 +29,26 @@ public final class MonteCarloBatchRunner {
         void onProgress(int completed, int total, String message);
     }
 
+    /**
+     * Executes batch runs in memory returning a List. 
+     * Delegates to the streaming implementation to ensure consistent optimization.
+     */
     public static List<MonteCarloRunRecord> runBatch(
             Simulation baseSimulation,
             int runs,
             ProgressCallback cb
     ) throws Exception {
-        if (runs < 1) throw new IllegalArgumentException("runs must be >= 1");
-
-        OpenRocketDocument doc = resolveDocument(baseSimulation);
-        // IMPORTANT:
-        // Do NOT clone/copy the Rocket when creating new Simulation instances.
-        // OpenRocket ties motor selections to FlightConfigurations owned by the document rocket.
-        // If you simulate with a copied Rocket, the Simulation can silently fall back to a
-        // "[No motors]" configuration, resulting in 0 m apogees.
-        // Waterloo Rocketry's implementation always uses document.getRocket() for this reason.
-        // (You can still vary conditions via SimulationOptions/SimulationConditions per-run.)
-        Rocket rocket = doc.getRocket();
-
-        List<MonteCarloRunRecord> out = new ArrayList<>(runs);
-
-        for (int i = 0; i < runs; i++) {
-            int runIndex = i + 1;
-            if (cb != null) cb.onProgress(i, runs, "Preparing run " + runIndex + " / " + runs);
-
-            // Use the document rocket (see note above)
-            Simulation s = new Simulation(doc, rocket);
-            s.setName(baseSimulation.getName() + " MC " + runIndex);
-
-            // Copy base options
-            s.copySimulationOptionsFrom(baseSimulation.getOptions());
-
-            // IMPORTANT (OR 24.12): motor selection lives on the rocket's FlightConfiguration,
-            // and some OR builds do not fully propagate the active FlightConfiguration when creating
-            // a brand-new Simulation(doc, rocket) + copySimulationOptionsFrom(...).
-            // If this step is skipped, simulations can silently fall back to a "[No motors]" config
-            // and terminate immediately at t=0 with ~0 m apogee.
-            copyFlightConfigurationBestEffort(baseSimulation, s);
-
-            // IMPORTANT (OR 24.12): wind settings may not be deep-copied by copySimulationOptionsFrom().
-            // Without this, newly constructed Simulations tend to fall back to default wind values.
-            copyWindSettings(baseSimulation.getOptions(), s.getOptions());
-
-            // Copy extensions (including MonteCarloExtension)
-            s.getSimulationExtensions().clear();
-            for (SimulationExtension ext : baseSimulation.getSimulationExtensions()) {
-                s.getSimulationExtensions().add(ext.clone());
-            }
-
-            // If deterministic seed is enabled, vary it per-run for repeatable-but-distinct draws
-            MonteCarloExtension mc = findMonteCarloExtension(s);
-            long seedUsed = 0L;
-            boolean det = false;
-            double windSpeedAverageSigmaMps = 0.0;
-            double windSpeedTurbulenceSigmaMps = 0.0;
-            if (mc != null) {
-                det = mc.isUseDeterministicSeed();
-                windSpeedAverageSigmaMps = mc.getWindSpeedAverageSigmaMps();
-                windSpeedTurbulenceSigmaMps = mc.getWindSpeedTurbulenceSigmaMps();
-                if (det) {
-                    seedUsed = mc.getRandomSeed() + i;
-                    mc.setRandomSeed(seedUsed);
-                } else {
-                    seedUsed = 0L;
-                }
-            }
-
-            if (cb != null) cb.onProgress(i, runs, "Running simulation " + runIndex + " / " + runs);
-
-            SimulationRunner.runSimulationInProcess(s);
-
-            // Extract results
-            SimulationData data = SimulationData.fromSimulation(s, 0);
-
-            SimulationOptions opts = s.getOptions();
-            MonteCarloRunRecord rec = new MonteCarloRunRecord(runIndex, s.getName(), det, seedUsed,
-                    windSpeedAverageSigmaMps, windSpeedTurbulenceSigmaMps,
-                    opts, data);
-            rec.setLandingEastM(data.landingEast_m);
-            rec.setLandingNorthM(data.landingNorth_m);
-            rec.setLandingLatDeg(data.landingLat_deg);
-            rec.setLandingLonDeg(data.landingLon_deg);
-            out.add(rec);
-
-            if (cb != null) cb.onProgress(runIndex, runs, "Completed " + runIndex + " / " + runs);
-        }
-
-        return out;
+        // Sequential execution is just parallel execution with 1 thread
+        return runBatchParallel(baseSimulation, runs, 1, cb);
     }
 
     /**
-     * Runs N Monte Carlo simulations in parallel using a fixed thread pool (JVM threads).
+     * Runs N Monte Carlo simulations in parallel using a fixed thread pool.
      * Returns results ordered by runIndex (1..runs).
+     * 
+     * Optimizations:
+     * 1. Uses chunking to lower Future/Task overhead.
+     * 2. Reduces lock contention on progress callback.
      */
     public static List<MonteCarloRunRecord> runBatchParallel(
             Simulation baseSimulation,
@@ -125,116 +56,19 @@ public final class MonteCarloBatchRunner {
             int threads,
             ProgressCallback cb
     ) throws Exception {
-        if (runs < 1) throw new IllegalArgumentException("runs must be >= 1");
-        int threadCount = Math.max(1, threads);
-
-        OpenRocketDocument doc = resolveDocument(baseSimulation);
-        Rocket rocket = doc.getRocket();
-
-        // Keep deterministic ordering in the returned list.
+        // Prepare storage for ordered results
         final MonteCarloRunRecord[] results = new MonteCarloRunRecord[runs];
 
-        // Progress counter for "completed" (1..runs)
-        final AtomicInteger completed = new AtomicInteger(0);
-
-        // Avoid concurrent UI/log callbacks interleaving mid-message
-        final Object cbLock = new Object();
-        final ProgressCallback safeCb = (done, total, msg) -> {
-            if (cb == null) return;
-            synchronized (cbLock) {
-                cb.onProgress(done, total, msg);
+        // Run streaming with a consumer that populates the array
+        runBatchParallelStreaming(baseSimulation, runs, threads, cb, (record) -> {
+            if (record != null) {
+                // Determine 0-based index from 1-based runIndex
+                // Safe to write concurrently to different array indices
+                results[record.runIndex - 1] = record;
             }
-        };
+        });
 
-        ExecutorService pool = Executors.newFixedThreadPool(threadCount);
-        List<Future<?>> futures = new ArrayList<>(runs);
-
-        try {
-            for (int i = 0; i < runs; i++) {
-                final int runZeroBased = i;
-                final int runIndex = i + 1;
-
-                safeCb.onProgress(completed.get(), runs, "Queued run " + runIndex + " / " + runs);
-
-                futures.add(pool.submit(() -> {
-                    // Build an independent Simulation instance for this run
-                    Simulation s = new Simulation(doc, rocket);
-                    s.setName(baseSimulation.getName() + " MC " + runIndex);
-
-                    // Copy base options
-                    s.copySimulationOptionsFrom(baseSimulation.getOptions());
-
-                    // Ensure motor FlightConfiguration carries over (see runBatch)
-                    copyFlightConfigurationBestEffort(baseSimulation, s);
-
-                    // IMPORTANT (OR 24.12): deep-copy wind settings (see comment in runBatch)
-                    copyWindSettings(baseSimulation.getOptions(), s.getOptions());
-
-                    // Copy extensions (including MonteCarloExtension)
-                    s.getSimulationExtensions().clear();
-                    for (SimulationExtension ext : baseSimulation.getSimulationExtensions()) {
-                        s.getSimulationExtensions().add(ext.clone());
-                    }
-
-                    // If deterministic seed is enabled, vary it per-run for repeatable-but-distinct draws
-                    MonteCarloExtension mc = findMonteCarloExtension(s);
-                    long seedUsed = 0L;
-                    boolean det = false;
-                    double windSpeedAverageSigmaMps = 0.0;
-                    double windSpeedTurbulenceSigmaMps = 0.0;
-                    if (mc != null) {
-                        det = mc.isUseDeterministicSeed();
-                        windSpeedAverageSigmaMps = mc.getWindSpeedAverageSigmaMps();
-                        windSpeedTurbulenceSigmaMps = mc.getWindSpeedTurbulenceSigmaMps();
-                        if (det) {
-                            seedUsed = mc.getRandomSeed() + runZeroBased;
-                            mc.setRandomSeed(seedUsed);
-                        } else {
-                            seedUsed = 0L;
-                        }
-                    }
-
-                    safeCb.onProgress(completed.get(), runs, "Running simulation " + runIndex + " / " + runs);
-
-                    try {
-                        SimulationRunner.runSimulationInProcess(s);
-
-                        // Extract results
-                        SimulationData data = SimulationData.fromSimulation(s, 0);
-
-                        SimulationOptions opts = s.getOptions();
-                        MonteCarloRunRecord rec = new MonteCarloRunRecord(runIndex, s.getName(), det, seedUsed,
-                                windSpeedAverageSigmaMps, windSpeedTurbulenceSigmaMps,
-                                opts, data);
-                        rec.setLandingEastM(data.landingEast_m);
-                        rec.setLandingNorthM(data.landingNorth_m);
-                        rec.setLandingLatDeg(data.landingLat_deg);
-                        rec.setLandingLonDeg(data.landingLon_deg);
-                        results[runZeroBased] = rec;
-
-                        int done = completed.incrementAndGet();
-                        safeCb.onProgress(done, runs, "Completed " + done + " / " + runs);
-                    } catch (Exception ex) {
-                        throw new RuntimeException(ex);
-                    }
-                }));
-            }
-
-            // Wait; cancel remaining tasks on first failure
-            for (Future<?> f : futures) {
-                try {
-                    f.get();
-                } catch (Exception ex) {
-                    for (Future<?> other : futures) {
-                        other.cancel(true);
-                    }
-                    throw unwrap(ex);
-                }
-            }
-        } finally {
-            pool.shutdownNow();
-        }
-
+        // Filter out any potential nulls if partial failure occurred
         List<MonteCarloRunRecord> out = new ArrayList<>(runs);
         for (MonteCarloRunRecord r : results) {
             if (r != null) out.add(r);
@@ -242,8 +76,146 @@ public final class MonteCarloBatchRunner {
         return out;
     }
 
+    /**
+     * New Pathway: Streaming execution.
+     * Allows processing large batches without holding all outcomes in memory.
+     * 
+     * Thread Safety Note:
+     * OpenRocket Simulation objects are not thread-safe if shared.
+     * We create a dedicated new Simulation(doc, rocket) for each run inside the worker threads.
+     * The document and rocket are treated as effectively read-only during simulation.
+     */
+    public static void runBatchParallelStreaming(
+            Simulation baseSimulation,
+            int runs,
+            int threads,
+            ProgressCallback cb,
+            Consumer<MonteCarloRunRecord> resultConsumer
+    ) throws Exception {
+        if (runs < 1) throw new IllegalArgumentException("runs must be >= 1");
+        
+        final int availableCores = Runtime.getRuntime().availableProcessors();
+        final int threadCount = threads <= 0 ? availableCores : Math.max(1, threads);
+
+        OpenRocketDocument doc = resolveDocument(baseSimulation);
+        Rocket rocket = doc.getRocket(); // Shared Rocket model
+
+        // Atomic counters for progress
+        final AtomicInteger completedCounter = new AtomicInteger(0);
+        
+        // Calculate chunk size to balance load and overhead
+        // Target: ~4 chunks per thread to allow some stealing/balancing, but cap min/max size
+        int rawChunkSize = runs / (threadCount * 4);
+        int chunkSize = Math.max(10, Math.min(200, rawChunkSize)); // Between 10 and 200 per task
+        
+        // Interval for callbacks to reduce UI contention (e.g. notify every 1% or 20 runs)
+        final int notifyInterval = Math.max(1, runs / 100);
+
+        ExecutorService pool = Executors.newFixedThreadPool(threadCount);
+        List<Future<?>> futures = new ArrayList<>();
+
+        if (cb != null) cb.onProgress(0, runs, "Initializing batch...");
+
+        try {
+            int currentStart = 0;
+            while (currentStart < runs) {
+                final int start = currentStart;
+                final int end = Math.min(currentStart + chunkSize, runs);
+                
+                // Submit task for runs [start, end)
+                futures.add(pool.submit(() -> {
+                    try {
+                        // Thread-local logic: Create independent sim per run
+                        for (int i = start; i < end; i++) {
+                            // Check for interruption (fast exit on cancel)
+                            if (Thread.currentThread().isInterrupted()) break;
+
+                            int runIndex = i + 1;
+                            
+                            // 1. Create Simulation & Copy settings
+                            Simulation s = new Simulation(doc, rocket);
+                            s.setName(baseSimulation.getName() + " MC " + runIndex);
+                            s.copySimulationOptionsFrom(baseSimulation.getOptions());
+                            
+                            // 2. OR 24.12 Safeguards (Motor + Wind)
+                            copyFlightConfigurationBestEffort(baseSimulation, s);
+                            copyWindSettings(baseSimulation.getOptions(), s.getOptions());
+
+                            // 3. Clone extensions to isolate state
+                            s.getSimulationExtensions().clear();
+                            for (SimulationExtension ext : baseSimulation.getSimulationExtensions()) {
+                                s.getSimulationExtensions().add(ext.clone());
+                            }
+
+                            // 4. MC Logic: Seeds & Perturbations
+                            MonteCarloExtension mc = findMonteCarloExtension(s);
+                            long seedUsed = 0L;
+                            boolean det = false;
+                            double wSpeedSigma = 0;
+                            double wTurbSigma = 0;
+                            
+                            if (mc != null) {
+                                det = mc.isUseDeterministicSeed();
+                                wSpeedSigma = mc.getWindSpeedAverageSigmaMps();
+                                wTurbSigma = mc.getWindSpeedTurbulenceSigmaMps();
+                                if (det) {
+                                    // Deterministic Seed Logic: Base + RunIndex
+                                    seedUsed = mc.getRandomSeed() + i;
+                                    mc.setRandomSeed(seedUsed);
+                                }
+                            }
+
+                            // 5. Execute Run (In-process)
+                            SimulationRunner.runSimulationInProcess(s);
+                            
+                            // 6. Extract Data
+                            SimulationData data = SimulationData.fromSimulation(s, 0);
+                            SimulationOptions opts = s.getOptions();
+                            
+                            MonteCarloRunRecord rec = new MonteCarloRunRecord(
+                                    runIndex, s.getName(), det, seedUsed,
+                                    wSpeedSigma, wTurbSigma, opts, data
+                            );
+                            rec.setLandingEastM(data.landingEast_m);
+                            rec.setLandingNorthM(data.landingNorth_m);
+                            rec.setLandingLatDeg(data.landingLat_deg);
+                            rec.setLandingLonDeg(data.landingLon_deg);
+                            
+                            // 7. Stream result
+                            if (resultConsumer != null) {
+                                resultConsumer.accept(rec);
+                            }
+
+                            // 8. Throttled Progress
+                            int c = completedCounter.incrementAndGet();
+                            if (cb != null && (c % notifyInterval == 0 || c == runs)) {
+                                cb.onProgress(c, runs, String.format("Completed %d / %d", c, runs));
+                            }
+                        }
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                }));
+                
+                currentStart = end;
+            }
+
+            // Wait for all chunks
+            for (Future<?> f : futures) {
+                try {
+                    f.get();
+                } catch (Exception ex) {
+                    // Start polite cancel
+                    for (Future<?> other : futures) other.cancel(true);
+                    throw unwrap(ex);
+                }
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
     private static Exception unwrap(Exception ex) {
-        // Future.get wraps exceptions; unwrap the original Exception if possible.
         Throwable t = ex;
         while (t.getCause() != null && (t instanceof java.util.concurrent.ExecutionException || t instanceof RuntimeException)) {
             t = t.getCause();
@@ -276,7 +248,7 @@ public final class MonteCarloBatchRunner {
             }
         }
 
-        throw new IllegalStateException("Could not resolve OpenRocketDocument from Simulation. (Simulation.getDocument() not found)");
+        throw new IllegalStateException("Could not resolve OpenRocketDocument from Simulation.");
     }
 
     // -------------------------------------------------------------------------
@@ -330,9 +302,7 @@ public final class MonteCarloBatchRunner {
                     if (tryInvokeSetter(dstOpts, "setMotorConfigurationId", id2)) return;
                 }
             }
-        } catch (Throwable ignored) {
-        }
-
+        } catch (Throwable ignored) {}
         // 4) Last resort: copy selected configuration on the rocket itself
         try {
             Object srcRocket = invokeObject(srcSim, "getRocket");
@@ -343,8 +313,7 @@ public final class MonteCarloBatchRunner {
                     tryInvokeSetter(dstRocket, "setSelectedConfiguration", sel);
                 }
             }
-        } catch (Throwable ignored) {
-        }
+        } catch (Throwable ignored) {}
     }
 
     // -------------------------------------------------------------------------
@@ -494,7 +463,6 @@ public final class MonteCarloBatchRunner {
             m.invoke(target, value);
             return true;
         } catch (Exception ignored) {
-            // If the setter takes an interface/supertype, try to find compatible method
             for (Method m : target.getClass().getMethods()) {
                 if (!m.getName().equals(setterName)) continue;
                 Class<?>[] p = m.getParameterTypes();

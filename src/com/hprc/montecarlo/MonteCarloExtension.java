@@ -160,28 +160,35 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
                 }
             }
 
-            // B) Turbulence std dev: set per-level standard deviation.
+            // B) Turbulence std dev: perturb the per-level turbulence.
+            //    We calculate ONE delta to shift the day's turbulence globally (calmer/gustier day).
             if (turbSigmaMps > 0.0) {
+                final double deltaTurb = rng.nextGaussian() * turbSigmaMps;
                 for (MultiLevelPinkNoiseWindModel.LevelWindModel level : ml.getLevels()) {
+                    double baseTurb = level.getStandardDeviation(); // This is the level's turbulence setting
+                    double varied = Math.max(0.0, baseTurb + deltaTurb);
                     try {
-                        level.setStandardDeviation(turbSigmaMps);
-                    } catch (Throwable ignored) {
+                        level.setStandardDeviation(varied);
+                    } catch (Throwable ignored) { }
+                    
+                    if (debugEnabled) {
+                        log.debug("MC Wind(turb) @ {} m: baseTurb={} m/s, sigmaTurb={} m/s, variedTurb={} m/s",
+                                level.getAltitude(), baseTurb, turbSigmaMps, varied);
                     }
-                }
-                if (debugEnabled) {
-                    log.debug("MC Wind(turbulence): set per-level standard deviation to {} m/s", turbSigmaMps);
                 }
             }
 
-            // Direction perturbation (per-level)
+            // Direction perturbation: Shift ALL levels by same random rotation.
+            // (Previously this was inside the loop, creating chaotic shear)
             if (dirSigmaRad > 0.0) {
+                final double deltaDir = rng.nextGaussian() * dirSigmaRad;
                 for (MultiLevelPinkNoiseWindModel.LevelWindModel level : ml.getLevels()) {
                     double baseDir = level.getDirection();
-                    double variedDir = baseDir + rng.nextGaussian() * dirSigmaRad;
+                    double variedDir = baseDir + deltaDir;
                     level.setDirection(variedDir);
                     if (debugEnabled) {
-                        log.debug("MC Wind(dir) @ {} m: baseDir={} deg, sigmaDir={} deg, variedDir={} deg",
-                                level.getAltitude(), Math.toDegrees(baseDir), windDirectionStdDevDeg, Math.toDegrees(variedDir));
+                        log.debug("MC Wind(dir) @ {} m: baseDir={} deg, delta={} deg, variedDir={} deg",
+                                level.getAltitude(), Math.toDegrees(baseDir), Math.toDegrees(deltaDir), Math.toDegrees(variedDir));
                     }
                 }
             }
@@ -206,16 +213,19 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
                 }
             }
 
-            // B) Turbulence std dev (gust-style)
+            // B) Turbulence variation
             if (turbSigmaMps > 0.0) {
-                boolean set = tryInvokeVoidDouble(windTarget, "setWindStandardDeviation", turbSigmaMps);
+                double baseTurb = getScalarWindTurbulenceMps(conditions, opts, windModel);
+                double variedTurb = Math.max(0.0, baseTurb + rng.nextGaussian() * turbSigmaMps);
+
+                boolean set = tryInvokeVoidDouble(windTarget, "setWindStandardDeviation", variedTurb);
                 if (!set) {
-                    set = tryInvokeVoidDouble(windTarget, "setWindSpeedStandardDeviation", turbSigmaMps);
+                    set = tryInvokeVoidDouble(windTarget, "setWindSpeedStandardDeviation", variedTurb);
                 }
-                applyScalarWindStdDevToModel(windModel, turbSigmaMps);
+                applyScalarWindStdDevToModel(windModel, variedTurb);
                 if (debugEnabled) {
-                    log.debug("MC Wind(turbulence): set sigmaTurb={} m/s (target={}, setOnTarget={})",
-                            turbSigmaMps, windTarget.getClass().getSimpleName(), set);
+                    log.debug("MC Wind(turb): baseTurb={} m/s, sigmaTurb={} m/s, variedTurb={} m/s",
+                            baseTurb, turbSigmaMps, variedTurb);
                 }
             }
 
@@ -345,6 +355,19 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
         if (!Double.isFinite(s)) s = invokeDouble(opts, "getWindSpeed", Double.NaN);
         if (!Double.isFinite(s) || s < 0.0) s = 0.0;
         return s;
+    }
+
+    private static double getScalarWindTurbulenceMps(SimulationConditions conditions, SimulationOptions opts, Object windModel) {
+        // Try various property names for turbulence/stddev
+        double t = invokeDouble(windModel, "getWindStandardDeviation", Double.NaN);
+        if (!Double.isFinite(t)) t = invokeDouble(windModel, "getWindSpeedStandardDeviation", Double.NaN);
+        if (!Double.isFinite(t)) t = invokeDouble(windModel, "getStandardDeviation", Double.NaN);
+        if (!Double.isFinite(t)) t = invokeDouble(conditions, "getWindStandardDeviation", Double.NaN);
+        if (!Double.isFinite(t)) t = invokeDouble(conditions, "getWindSpeedStandardDeviation", Double.NaN);
+        if (!Double.isFinite(t)) t = invokeDouble(opts, "getWindStandardDeviation", Double.NaN);
+        // Default to 0.0 (no turbulence) if not set
+        if (!Double.isFinite(t) || t < 0.0) t = 0.0;
+        return t;
     }
 
     private static double getScalarWindDirectionRad(SimulationConditions conditions, SimulationOptions opts, Object windModel) {
