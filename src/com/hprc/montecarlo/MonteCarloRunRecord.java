@@ -203,7 +203,7 @@ public final class MonteCarloRunRecord {
         if (windModel != null) {
             turb = invokeDouble(windModel, "getTurbulenceIntensity", Double.NaN);
             if (!Double.isFinite(turb)) turb = invokeDouble(windModel, "getWindTurbulenceIntensity", Double.NaN);
-        }
+         }
         if (!Double.isFinite(turb)) turb = invokeDouble(src, "getWindTurbulenceIntensity", Double.NaN);
         if (!Double.isFinite(turb)) turb = invokeDouble(src, "getWindTurbulence", Double.NaN);
 
