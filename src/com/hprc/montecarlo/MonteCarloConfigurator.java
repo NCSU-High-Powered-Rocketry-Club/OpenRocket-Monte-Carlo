@@ -74,24 +74,13 @@ public class MonteCarloConfigurator
 
         panel.add(sectionLabel("Launch / Orientation variation"), "span 3, growx");
 
-        addAngleStdDev(panel, "Launch rail angle σ", UnitGroup.UNITS_ANGLE,
-                Math.toRadians(ext.getLaunchRodAngleStdDevDeg()),
-                v -> ext.setLaunchRodAngleStdDevDeg(Math.toDegrees(v)));
+        addAngleStdDev(panel, "Launch rail angle σ", ext, "LaunchRodAngleStdDevDeg");
+        addAngleStdDev(panel, "Launch rail direction σ", ext, "LaunchRodDirectionStdDevDeg");
 
-        addAngleStdDev(panel, "Launch rail direction σ", UnitGroup.UNITS_ANGLE,
-                Math.toRadians(ext.getLaunchRodDirectionStdDevDeg()),
-                v -> ext.setLaunchRodDirectionStdDevDeg(Math.toDegrees(v)));
+        addLengthStdDev(panel, "Launch altitude σ", ext, "LaunchAltitudeStdDevM");
 
-        addLengthStdDev(panel, "Launch altitude σ",
-                ext.getLaunchAltitudeStdDevM(), ext::setLaunchAltitudeStdDevM);
-
-        addAngleStdDev(panel, "Launch latitude σ", UnitGroup.UNITS_ANGLE,
-                Math.toRadians(ext.getLaunchLatitudeStdDevDeg()),
-                v -> ext.setLaunchLatitudeStdDevDeg(Math.toDegrees(v)));
-
-        addAngleStdDev(panel, "Launch longitude σ", UnitGroup.UNITS_ANGLE,
-                Math.toRadians(ext.getLaunchLongitudeStdDevDeg()),
-                v -> ext.setLaunchLongitudeStdDevDeg(Math.toDegrees(v)));
+        addAngleStdDev(panel, "Launch latitude σ", ext, "LaunchLatitudeStdDevDeg");
+        addAngleStdDev(panel, "Launch longitude σ", ext, "LaunchLongitudeStdDevDeg");
 
         panel.add(new JSeparator(), "span 3, growx");
 
@@ -107,10 +96,10 @@ public class MonteCarloConfigurator
         windAvgSigmaLabel.setEnabled(!multiLevelSelected);
         panel.add(windAvgSigmaLabel, "align label");
 
-        DoubleModel windAvgSigmaModel = new DoubleModel(ext.getWindSpeedAverageSigmaMps(), UnitGroup.UNITS_VELOCITY, 0);
+        // Use bound model manually constructed so we can set enabled state on components
+        DoubleModel windAvgSigmaModel = new DoubleModel(ext, "WindSpeedAverageSigmaMps", UnitGroup.UNITS_VELOCITY, 0);
         JSpinner windAvgSigmaSpinner = new JSpinner(windAvgSigmaModel.getSpinnerModel());
         windAvgSigmaSpinner.setEditor(new SpinnerEditor(windAvgSigmaSpinner));
-        windAvgSigmaSpinner.addChangeListener(e -> ext.setWindSpeedAverageSigmaMps(windAvgSigmaModel.getValue()));
         windAvgSigmaSpinner.setEnabled(!multiLevelSelected);
 
         UnitSelector windAvgSigmaUnits = new UnitSelector(windAvgSigmaModel);
@@ -129,12 +118,9 @@ public class MonteCarloConfigurator
         panel.add(windAvgSigmaUnits);
 
         // Wind speed turbulence σ (gust std-dev) — always enabled
-        addVelocityStdDev(panel, "Wind speed turbulence σ",
-                ext.getWindSpeedTurbulenceSigmaMps(), ext::setWindSpeedTurbulenceSigmaMps);
+        addVelocityStdDev(panel, "Wind speed turbulence σ", ext, "WindSpeedTurbulenceSigmaMps");
 
-        addAngleStdDev(panel, "Wind direction σ", UnitGroup.UNITS_ANGLE,
-                Math.toRadians(ext.getWindDirectionStdDevDeg()),
-                v -> ext.setWindDirectionStdDevDeg(Math.toDegrees(v)));
+        addAngleStdDev(panel, "Wind direction σ", ext, "WindDirectionStdDevDeg");
 
         addTemperatureStdDev(panel, "Temperature σ",
                 ext.getTemperatureStdDevC(), ext::setTemperatureStdDevC);
@@ -352,32 +338,29 @@ public class MonteCarloConfigurator
     }
 
 
-    private static void addAngleStdDev(JPanel panel, String label, UnitGroup group, double initial, DoubleConsumer setter) {
+    private static void addAngleStdDev(JPanel panel, String label, MonteCarloExtension ext, String property) {
         panel.add(new JLabel(label), "align label");
-        DoubleModel model = new DoubleModel(initial, group, 0);
+        DoubleModel model = new DoubleModel(ext, property, UnitGroup.UNITS_ANGLE, 0);
         JSpinner spinner = new JSpinner(model.getSpinnerModel());
         spinner.setEditor(new SpinnerEditor(spinner));
-        spinner.addChangeListener(e -> setter.accept(model.getValue()));
         panel.add(spinner, "growx");
         panel.add(new UnitSelector(model));
     }
 
-    private static void addVelocityStdDev(JPanel panel, String label, double initial, DoubleConsumer setter) {
+    private static void addVelocityStdDev(JPanel panel, String label, MonteCarloExtension ext, String property) {
         panel.add(new JLabel(label), "align label");
-        DoubleModel model = new DoubleModel(initial, UnitGroup.UNITS_VELOCITY, 0);
+        DoubleModel model = new DoubleModel(ext, property, UnitGroup.UNITS_VELOCITY, 0);
         JSpinner spinner = new JSpinner(model.getSpinnerModel());
         spinner.setEditor(new SpinnerEditor(spinner));
-        spinner.addChangeListener(e -> setter.accept(model.getValue()));
         panel.add(spinner, "growx");
         panel.add(new UnitSelector(model));
     }
 
-    private static void addLengthStdDev(JPanel panel, String label, double initial, DoubleConsumer setter) {
+    private static void addLengthStdDev(JPanel panel, String label, MonteCarloExtension ext, String property) {
         panel.add(new JLabel(label), "align label");
-        DoubleModel model = new DoubleModel(initial, UnitGroup.UNITS_LENGTH, 0);
+        DoubleModel model = new DoubleModel(ext, property, UnitGroup.UNITS_LENGTH, 0);
         JSpinner spinner = new JSpinner(model.getSpinnerModel());
         spinner.setEditor(new SpinnerEditor(spinner));
-        spinner.addChangeListener(e -> setter.accept(model.getValue()));
         panel.add(spinner, "growx");
         panel.add(new UnitSelector(model));
     }
