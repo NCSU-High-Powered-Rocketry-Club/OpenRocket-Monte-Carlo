@@ -97,10 +97,38 @@ public class MonteCarloConfigurator
 
         panel.add(sectionLabel("Atmosphere / Wind variation"), "span 3, growx");
 
-        // Wind speed sigmas (both are velocities, unit-selectable)
-        addVelocityStdDev(panel, "Wind speed average σ",
-                ext.getWindSpeedAverageSigmaMps(), ext::setWindSpeedAverageSigmaMps);
+        // Determine current wind model selection from the simulation options.
+        // If the simulation is using Multi-level wind, we disable the mean-wind sigma UI (by request)
+        // and only use the turbulence (gust std-dev) sigma.
+        final boolean multiLevelSelected = isMultiLevelWindSelected(sim.getOptions());
 
+        // Wind speed average σ (disabled when Multi-level wind is selected)
+        JLabel windAvgSigmaLabel = new JLabel("Wind speed average σ");
+        windAvgSigmaLabel.setEnabled(!multiLevelSelected);
+        panel.add(windAvgSigmaLabel, "align label");
+
+        DoubleModel windAvgSigmaModel = new DoubleModel(ext.getWindSpeedAverageSigmaMps(), UnitGroup.UNITS_VELOCITY, 0);
+        JSpinner windAvgSigmaSpinner = new JSpinner(windAvgSigmaModel.getSpinnerModel());
+        windAvgSigmaSpinner.setEditor(new SpinnerEditor(windAvgSigmaSpinner));
+        windAvgSigmaSpinner.addChangeListener(e -> ext.setWindSpeedAverageSigmaMps(windAvgSigmaModel.getValue()));
+        windAvgSigmaSpinner.setEnabled(!multiLevelSelected);
+
+        UnitSelector windAvgSigmaUnits = new UnitSelector(windAvgSigmaModel);
+        windAvgSigmaUnits.setEnabled(!multiLevelSelected);
+
+        if (multiLevelSelected) {
+            String tip = "Disabled because the base simulation is set to Multi-level wind.";
+            windAvgSigmaLabel.setToolTipText(tip);
+            windAvgSigmaSpinner.setToolTipText(tip);
+            windAvgSigmaUnits.setToolTipText(tip);
+            // Ensure the extension won't accidentally apply mean-wind variation in Multi-level mode.
+            ext.setWindSpeedAverageSigmaMps(0.0);
+        }
+
+        panel.add(windAvgSigmaSpinner, "growx");
+        panel.add(windAvgSigmaUnits);
+
+        // Wind speed turbulence σ (gust std-dev) — always enabled
         addVelocityStdDev(panel, "Wind speed turbulence σ",
                 ext.getWindSpeedTurbulenceSigmaMps(), ext::setWindSpeedTurbulenceSigmaMps);
 
@@ -164,10 +192,10 @@ public class MonteCarloConfigurator
                         return MonteCarloBatchRunner.runBatch(
                                 sim,
                                 runs,
-                                (completed, total, msg) -> SwingUtilities.invokeLater(() -> {
+                                (completed, total) -> SwingUtilities.invokeLater(() -> {
                                     progress.setMaximum(total);
                                     progress.setValue(completed);
-                                    progress.setString(msg);
+                                    progress.setString(completed + " / " + total);
                                 })
                         );
                     }
@@ -176,10 +204,10 @@ public class MonteCarloConfigurator
                             sim,
                             runs,
                             threads,
-                            (completed, total, msg) -> SwingUtilities.invokeLater(() -> {
+                            (completed, total) -> SwingUtilities.invokeLater(() -> {
                                 progress.setMaximum(total);
                                 progress.setValue(completed);
-                                progress.setString(msg);
+                                progress.setString(completed + " / " + total);
                             })
                     );
                 }
@@ -323,15 +351,6 @@ public class MonteCarloConfigurator
         return l;
     }
 
-    private static JComponent note(String text) {
-        JTextArea a = new JTextArea(text);
-        a.setEditable(false);
-        a.setOpaque(false);
-        a.setLineWrap(true);
-        a.setWrapStyleWord(true);
-        a.setBorder(BorderFactory.createEmptyBorder(6, 0, 0, 0));
-        return a;
-    }
 
     private static void addAngleStdDev(JPanel panel, String label, UnitGroup group, double initial, DoubleConsumer setter) {
         panel.add(new JLabel(label), "align label");
@@ -385,5 +404,45 @@ public class MonteCarloConfigurator
 
         panel.add(spinner, "growx");
         panel.add(new JLabel("mbar"));
+    }
+
+
+    /**
+     * Best-effort check of the simulation's wind model selection.
+     * We use reflection here to remain compatible across OpenRocket versions.
+     */
+    private static boolean isMultiLevelWindSelected(SimulationOptions opts) {
+        if (opts == null) return false;
+
+        // 1) Wind model type enum/name (most reliable)
+        try {
+            Object t = opts.getClass().getMethod("getWindModelType").invoke(opts);
+            if (t != null) {
+                String name = String.valueOf(t).trim().toLowerCase();
+                if (name.contains("multi") && name.contains("level")) return true;
+                if (name.contains("average")) return false;
+            }
+        } catch (Exception ignored) { }
+
+        // 2) Explicit boolean flag in some versions
+        try {
+            Object b = opts.getClass().getMethod("isMultiLevelWindModel").invoke(opts);
+            if (b instanceof Boolean bb) return bb;
+        } catch (Exception ignored) { }
+        try {
+            Object b = opts.getClass().getMethod("isMultiLevelWindModelEnabled").invoke(opts);
+            if (b instanceof Boolean bb) return bb;
+        } catch (Exception ignored) { }
+
+        // 3) Wind model instance type/name
+        try {
+            Object wm = opts.getClass().getMethod("getWindModel").invoke(opts);
+            if (wm != null) {
+                String cls = wm.getClass().getName().toLowerCase();
+                if (cls.contains("multilevel")) return true;
+            }
+        } catch (Exception ignored) { }
+
+        return false;
     }
 }

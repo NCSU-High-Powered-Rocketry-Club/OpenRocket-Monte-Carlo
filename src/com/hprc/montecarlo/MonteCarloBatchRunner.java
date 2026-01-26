@@ -1,274 +1,353 @@
 package com.hprc.montecarlo;
 
-import info.openrocket.core.document.OpenRocketDocument;
 import info.openrocket.core.document.Simulation;
 import info.openrocket.core.models.wind.MultiLevelPinkNoiseWindModel;
 import info.openrocket.core.rocketcomponent.Rocket;
-import info.openrocket.core.simulation.SimulationConditions;
 import info.openrocket.core.simulation.SimulationOptions;
 import info.openrocket.core.simulation.extension.SimulationExtension;
 
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
+import java.util.Objects;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.Consumer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.*;
+import java.lang.reflect.Modifier;
+
 
 /**
- * Runs N Monte Carlo simulations sequentially or in parallel and returns per-run records.
- * Optimized for reduced scheduling overhead via chunking.
+ * Runs Monte Carlo simulations by cloning the base simulation N times and running them in-process.
+ *
+ * IMPORTANT:
+ * - This class is intended to be used by SimulationEngine (the Simulation Extension "Run" button flow).
+ * - Each run gets a fresh Simulation(doc, rocket) instance and fresh cloned extensions.
+ * - Wind settings are deep-copied to avoid shared references that would mutate the base simulation.
  */
 public final class MonteCarloBatchRunner {
 
-    private MonteCarloBatchRunner() {}
+    private MonteCarloBatchRunner() { }
+
+    private static final Logger log = LoggerFactory.getLogger(MonteCarloBatchRunner.class);
 
     public interface ProgressCallback {
-        void onProgress(int completed, int total, String message);
+        void onProgress(int completed, int total);
     }
 
-    /**
-     * Executes batch runs in memory returning a List. 
-     * Delegates to the streaming implementation to ensure consistent optimization.
-     */
+    public interface RecordConsumer {
+        void onRecord(MonteCarloRunRecord record);
+    }
+
     public static List<MonteCarloRunRecord> runBatch(
             Simulation baseSimulation,
             int runs,
             ProgressCallback cb
     ) throws Exception {
-        // Sequential execution is just parallel execution with 1 thread
         return runBatchParallel(baseSimulation, runs, 1, cb);
     }
 
-    /**
-     * Runs N Monte Carlo simulations in parallel using a fixed thread pool.
-     * Returns results ordered by runIndex (1..runs).
-     * 
-     * Optimizations:
-     * 1. Uses chunking to lower Future/Task overhead.
-     * 2. Reduces lock contention on progress callback.
-     */
     public static List<MonteCarloRunRecord> runBatchParallel(
             Simulation baseSimulation,
             int runs,
             int threads,
             ProgressCallback cb
     ) throws Exception {
-        // Prepare storage for ordered results
-        final MonteCarloRunRecord[] results = new MonteCarloRunRecord[runs];
-
-        // Run streaming with a consumer that populates the array
-        runBatchParallelStreaming(baseSimulation, runs, threads, cb, (record) -> {
-            if (record != null) {
-                // Determine 0-based index from 1-based runIndex
-                // Safe to write concurrently to different array indices
-                results[record.runIndex - 1] = record;
-            }
-        });
-
-        // Filter out any potential nulls if partial failure occurred
-        List<MonteCarloRunRecord> out = new ArrayList<>(runs);
-        for (MonteCarloRunRecord r : results) {
-            if (r != null) out.add(r);
-        }
+        List<MonteCarloRunRecord> out = Collections.synchronizedList(new ArrayList<>());
+        runBatchParallelStreaming(baseSimulation, runs, threads, cb, out::add);
         return out;
     }
 
-    /**
-     * New Pathway: Streaming execution.
-     * Allows processing large batches without holding all outcomes in memory.
-     * 
-     * Thread Safety Note:
-     * OpenRocket Simulation objects are not thread-safe if shared.
-     * We create a dedicated new Simulation(doc, rocket) for each run inside the worker threads.
-     * The document and rocket are treated as effectively read-only during simulation.
-     */
     public static void runBatchParallelStreaming(
             Simulation baseSimulation,
             int runs,
             int threads,
             ProgressCallback cb,
-            Consumer<MonteCarloRunRecord> resultConsumer
+            RecordConsumer consumer
     ) throws Exception {
+
+        Objects.requireNonNull(baseSimulation, "baseSimulation");
         if (runs < 1) throw new IllegalArgumentException("runs must be >= 1");
+        if (threads < 1) threads = 1;
+
+        final Rocket rocket = baseSimulation.getRocket();
+        if (rocket == null) throw new IllegalStateException("baseSimulation.getRocket() returned null");
         
-        final int availableCores = Runtime.getRuntime().availableProcessors();
-        final int threadCount = threads <= 0 ? availableCores : Math.max(1, threads);
+        // Try multiple methods to resolve the document
+        final Object doc = resolveDocument(baseSimulation, rocket);
+        if (doc == null) {
+            throw new IllegalStateException(
+                "Cannot resolve document from base simulation. " +
+                "Tried: getDocument(), rocket.getDocument(), document field. " +
+                "Ensure the simulation is properly attached to an OpenRocketDocument."
+            );
+        }
 
-        OpenRocketDocument doc = resolveDocument(baseSimulation);
-        Rocket rocket = doc.getRocket(); // Shared Rocket model
+        final ExecutorService pool = Executors.newFixedThreadPool(threads, new ThreadFactory() {
+            private final AtomicInteger n = new AtomicInteger(1);
+            @Override public Thread newThread(Runnable r) {
+                Thread t = new Thread(r, "hprc-mc-" + n.getAndIncrement());
+                t.setDaemon(true);
+                return t;
+            }
+        });
 
-        // Atomic counters for progress
-        final AtomicInteger completedCounter = new AtomicInteger(0);
-        
-        // Calculate chunk size to balance load and overhead
-        // Target: ~4 chunks per thread to allow some stealing/balancing, but cap min/max size
-        int rawChunkSize = runs / (threadCount * 4);
-        int chunkSize = Math.max(10, Math.min(200, rawChunkSize)); // Between 10 and 200 per task
-        
-        // Interval for callbacks to reduce UI contention (e.g. notify every 1% or 20 runs)
-        final int notifyInterval = Math.max(1, runs / 100);
+        final AtomicInteger completed = new AtomicInteger(0);
+        final List<Future<?>> futures = new ArrayList<>();
 
-        ExecutorService pool = Executors.newFixedThreadPool(threadCount);
-        List<Future<?>> futures = new ArrayList<>();
-
-        if (cb != null) cb.onProgress(0, runs, "Initializing batch...");
+        // Chunking reduces executor overhead for large run counts.
+        final int chunkSize = Math.max(1, runs / (threads * 4));
 
         try {
-            int currentStart = 0;
-            while (currentStart < runs) {
-                final int start = currentStart;
-                final int end = Math.min(currentStart + chunkSize, runs);
-                
-                // Submit task for runs [start, end)
+            for (int start = 0; start < runs; start += chunkSize) {
+                final int s0 = start;
+                final int s1 = Math.min(runs, start + chunkSize);
+
                 futures.add(pool.submit(() -> {
-                    try {
-                        // Thread-local logic: Create independent sim per run
-                        for (int i = start; i < end; i++) {
-                            // Check for interruption (fast exit on cancel)
-                            if (Thread.currentThread().isInterrupted()) break;
+                    for (int i = s0; i < s1; i++) {
+                        if (Thread.currentThread().isInterrupted()) return;
 
-                            int runIndex = i + 1;
-                            
-                            // 1. Create Simulation & Copy settings
-                            Simulation s = new Simulation(doc, rocket);
-                            s.setName(baseSimulation.getName() + " MC " + runIndex);
-                            s.copySimulationOptionsFrom(baseSimulation.getOptions());
-                            
-                            // 2. OR 24.12 Safeguards (Motor + Wind)
-                            copyFlightConfigurationBestEffort(baseSimulation, s);
-                            copyWindSettings(baseSimulation.getOptions(), s.getOptions());
+                        int runIndex = i + 1;
 
-                            // 3. Clone extensions to isolate state
-                            s.getSimulationExtensions().clear();
+                        try {
+                            Simulation sim = newSimulation(doc, rocket);
+                            sim.setName(baseSimulation.getName() + " MC " + runIndex);
+
+                            // Copy base options (many things are correct here, but wind objects can be shared)
+                            sim.copySimulationOptionsFrom(baseSimulation.getOptions());
+
+                            // Ensure motor/flight configuration is preserved
+                            copyFlightConfigurationBestEffort(baseSimulation, sim);
+
+                            // Deep-copy wind to prevent base mutation via shared wind-model references
+                            deepCopyWindSettings(baseSimulation.getOptions(), sim.getOptions());
+
+                            // Clone extensions to isolate state
+                            sim.getSimulationExtensions().clear();
                             for (SimulationExtension ext : baseSimulation.getSimulationExtensions()) {
-                                s.getSimulationExtensions().add(ext.clone());
+                                sim.getSimulationExtensions().add(ext.clone());
                             }
 
-                            // 4. MC Logic: Seeds & Perturbations
-                            MonteCarloExtension mc = findMonteCarloExtension(s);
-                            long seedUsed = 0L;
+                            // Configure MC extension for this run (batch context + per-run seed)
+                            MonteCarloExtension mc = findMonteCarloExtension(sim);
+                            long seedUsed = ThreadLocalRandom.current().nextLong();
                             boolean det = false;
-                            double wSpeedSigma = 0;
-                            double wTurbSigma = 0;
-                            
+                            double wSpeedSigma = 0.0;
+                            double wTurbSigma = 0.0;
+
                             if (mc != null) {
+                                mc.setBatchRunContext(true);
+
                                 det = mc.isUseDeterministicSeed();
                                 wSpeedSigma = mc.getWindSpeedAverageSigmaMps();
                                 wTurbSigma = mc.getWindSpeedTurbulenceSigmaMps();
+
                                 if (det) {
-                                    // Deterministic Seed Logic: Base + RunIndex
-                                    seedUsed = mc.getRandomSeed() + i;
-                                    mc.setRandomSeed(seedUsed);
+                                    // Deterministic: baseSeed + (runIndex-1)
+                                    seedUsed = mc.getRandomSeed() + (runIndex - 1);
                                 }
+                                mc.setBatchSeed(seedUsed);
                             }
 
-                            // 5. Execute Run (In-process)
-                            SimulationRunner.runSimulationInProcess(s);
-                            
-                            // 6. Extract Data
-                            SimulationData data = SimulationData.fromSimulation(s, 0);
-                            SimulationOptions opts = s.getOptions();
-                            
+                            // Execute run (OpenRocket will call initialize(...) on extensions)
+                            SimulationRunner.runSimulationInProcess(sim);
+
+                            // Prefer the effective seed actually used inside initialize (for debugging)
+                            if (mc != null) {
+                                long eff = mc.getEffectiveSeedUsed();
+                                if (eff != Long.MIN_VALUE) seedUsed = eff;
+                            }
+
+                            // Extract results
+                            SimulationData data = SimulationData.fromSimulation(sim, 0);
+                            SimulationOptions opts = sim.getOptions();
+
                             MonteCarloRunRecord rec = new MonteCarloRunRecord(
-                                    runIndex, s.getName(), det, seedUsed,
+                                    runIndex, sim.getName(), det, seedUsed,
                                     wSpeedSigma, wTurbSigma, opts, data
                             );
                             rec.setLandingEastM(data.landingEast_m);
                             rec.setLandingNorthM(data.landingNorth_m);
                             rec.setLandingLatDeg(data.landingLat_deg);
                             rec.setLandingLonDeg(data.landingLon_deg);
-                            
-                            // 7. Stream result
-                            if (resultConsumer != null) {
-                                resultConsumer.accept(rec);
-                            }
 
-                            // 8. Throttled Progress
-                            int c = completedCounter.incrementAndGet();
-                            if (cb != null && (c % notifyInterval == 0 || c == runs)) {
-                                cb.onProgress(c, runs, String.format("Completed %d / %d", c, runs));
-                            }
+                            if (consumer != null) consumer.onRecord(rec);
+
+                        } catch (Exception ex) {
+                            // Surface the first failure with context
+                            throw new RuntimeException("Monte Carlo run " + runIndex + " failed", ex);
+                        } finally {
+                            int c = completed.incrementAndGet();
+                            if (cb != null) cb.onProgress(c, runs);
                         }
-                    } catch (Exception e) {
-                        throw new RuntimeException(e);
                     }
                 }));
-                
-                currentStart = end;
             }
 
-            // Wait for all chunks
-            for (Future<?> f : futures) {
-                try {
-                    f.get();
-                } catch (Exception ex) {
-                    // Start polite cancel
-                    for (Future<?> other : futures) other.cancel(true);
-                    throw unwrap(ex);
-                }
-            }
+            // Join
+            for (Future<?> f : futures) f.get();
+
         } finally {
             pool.shutdownNow();
         }
     }
 
-    private static Exception unwrap(Exception ex) {
-        Throwable t = ex;
-        while (t.getCause() != null && (t instanceof java.util.concurrent.ExecutionException || t instanceof RuntimeException)) {
-            t = t.getCause();
+    // -------------------------------------------------------------------------
+    // Document resolution (multiple fallback methods)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Attempts to resolve the OpenRocketDocument from various sources.
+     * Tries multiple methods to handle different OpenRocket versions and contexts.
+     */
+    private static Object resolveDocument(Simulation baseSimulation, Rocket rocket) {
+        Object doc = null;
+
+        // 1) Try simulation.getDocument()
+        doc = invokeObject(baseSimulation, "getDocument");
+        if (doc != null) return doc;
+
+        // 2) Try rocket.getDocument()
+        doc = invokeObject(rocket, "getDocument");
+        if (doc != null) return doc;
+
+        // 3) Try to get document from rocket's parent (some versions store it there)
+        Object parent = invokeObject(rocket, "getParent");
+        if (parent != null) {
+            doc = invokeObject(parent, "getDocument");
+            if (doc != null) return doc;
         }
-        if (t instanceof Exception e) return e;
-        return ex;
+
+        // 4) Try accessing 'document' field directly via reflection on the simulation
+        doc = getFieldValue(baseSimulation, "document");
+        if (doc != null) return doc;
+
+        // 5) Try accessing 'doc' field directly via reflection on the simulation
+        doc = getFieldValue(baseSimulation, "doc");
+        if (doc != null) return doc;
+
+        // 6) Try simulation.getOptions().getDocument() (some versions)
+        SimulationOptions opts = baseSimulation.getOptions();
+        if (opts != null) {
+            doc = invokeObject(opts, "getDocument");
+            if (doc != null) return doc;
+        }
+
+        // 7) Try to get the document from the rocket's default configuration
+        Object config = invokeObject(rocket, "getDefaultConfiguration");
+        if (config != null) {
+            doc = invokeObject(config, "getDocument");
+            if (doc != null) return doc;
+        }
+
+        // 8) Try rocket.getRoot() then getDocument()
+        Object root = invokeObject(rocket, "getRoot");
+        if (root != null && root != rocket) {
+            doc = invokeObject(root, "getDocument");
+            if (doc != null) return doc;
+        }
+
+        // 9) Look for document in simulation's stored data
+        doc = invokeObject(baseSimulation, "getSimulatedData");
+        if (doc != null) {
+            Object dataDoc = invokeObject(doc, "getDocument");
+            if (dataDoc != null) return dataDoc;
+        }
+
+        return null;
     }
 
+    /**
+     * Gets a field value using reflection, checking the class hierarchy.
+     */
+    private static Object getFieldValue(Object target, String fieldName) {
+        if (target == null || fieldName == null) return null;
+        
+        Class<?> clazz = target.getClass();
+        while (clazz != null) {
+            try {
+                Field f = clazz.getDeclaredField(fieldName);
+                f.setAccessible(true);
+                return f.get(target);
+            } catch (NoSuchFieldException e) {
+                // Try parent class
+                clazz = clazz.getSuperclass();
+            } catch (Exception e) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    // -------------------------------------------------------------------------
+    // Simulation construction (reflection-safe)
+    // -------------------------------------------------------------------------
+
+    private static Simulation newSimulation(Object doc, Rocket rocket) throws Exception {
+        // Prefer: new Simulation(OpenRocketDocument, Rocket)
+        try {
+            Constructor<Simulation> c = Simulation.class.getConstructor(doc.getClass(), Rocket.class);
+            return c.newInstance(doc, rocket);
+        } catch (NoSuchMethodException ignored) {
+            // Common OR signature: Simulation(OpenRocketDocument, Rocket) with OpenRocketDocument class, but
+            // reflection above may fail due to different classloaders. Fall back to public constructor by name.
+        }
+
+        // Try to find any (OpenRocketDocument-like, Rocket) constructor
+        for (Constructor<?> c : Simulation.class.getConstructors()) {
+            Class<?>[] p = c.getParameterTypes();
+            if (p.length == 2 && Rocket.class.isAssignableFrom(p[1]) && p[0].isInstance(doc)) {
+                return (Simulation) c.newInstance(doc, rocket);
+            }
+        }
+
+        // Try constructors with different parameter orders
+        for (Constructor<?> c : Simulation.class.getConstructors()) {
+            Class<?>[] p = c.getParameterTypes();
+            if (p.length == 2 && Rocket.class.isAssignableFrom(p[0]) && p[1].isInstance(doc)) {
+                return (Simulation) c.newInstance(rocket, doc);
+            }
+        }
+
+        // Try single-argument constructor with just the document
+        for (Constructor<?> c : Simulation.class.getConstructors()) {
+            Class<?>[] p = c.getParameterTypes();
+            if (p.length == 1 && p[0].isInstance(doc)) {
+                Simulation sim = (Simulation) c.newInstance(doc);
+                // Set the rocket if there's a method for it
+                tryInvokeSetter(sim, "setRocket", rocket);
+                return sim;
+            }
+        }
+
+        throw new IllegalStateException("Unable to construct Simulation(doc, rocket) for this OpenRocket version");
+    }
+
+    // -------------------------------------------------------------------------
+    // Extension lookup
+    // -------------------------------------------------------------------------
+
     private static MonteCarloExtension findMonteCarloExtension(Simulation sim) {
+        if (sim == null) return null;
         for (SimulationExtension ext : sim.getSimulationExtensions()) {
             if (ext instanceof MonteCarloExtension mc) return mc;
         }
         return null;
     }
 
-    private static OpenRocketDocument resolveDocument(Simulation sim) throws Exception {
-        // Prefer sim.getDocument() if available
-        try {
-            Method m = sim.getClass().getMethod("getDocument");
-            Object v = m.invoke(sim);
-            if (v instanceof OpenRocketDocument d) return d;
-        } catch (NoSuchMethodException ignored) { }
-
-        // Some versions store it as a field; try reflection fallback
-        for (var f : sim.getClass().getDeclaredFields()) {
-            if (OpenRocketDocument.class.isAssignableFrom(f.getType())) {
-                f.setAccessible(true);
-                Object v = f.get(sim);
-                if (v instanceof OpenRocketDocument d) return d;
-            }
-        }
-
-        throw new IllegalStateException("Could not resolve OpenRocketDocument from Simulation.");
-    }
-
     // -------------------------------------------------------------------------
-    // FLIGHT CONFIGURATION (motor selection) BEST-EFFORT COPY
+    // Flight configuration copy (motor selection)
     // -------------------------------------------------------------------------
 
-    /**
-     * Best-effort copy of motor / flight configuration from one Simulation to another.
-     *
-     * Why this exists:
-     *  - Motor selection in OpenRocket is handled through FlightConfigurations.
-     *  - Depending on OR build/version, copySimulationOptionsFrom(...) may NOT carry over the
-     *    selected FlightConfiguration, which can cause new simulations to run with "[No motors]".
-     *
-     * This method uses reflection only so we don't hard-bind to OpenRocket internal API changes.
-     */
     private static void copyFlightConfigurationBestEffort(Simulation srcSim, Simulation dstSim) {
         if (srcSim == null || dstSim == null) return;
 
-        // 1) Try copying an ID (most stable pattern)
+        // 1) Copy an ID if available (most stable)
         Object id = invokeObject(srcSim, "getFlightConfigurationId");
         if (id == null) id = invokeObject(srcSim, "getMotorConfigurationID");
         if (id == null) id = invokeObject(srcSim, "getMotorConfigurationId");
@@ -278,7 +357,7 @@ public final class MonteCarloBatchRunner {
             if (tryInvokeSetter(dstSim, "setMotorConfigurationId", id)) return;
         }
 
-        // 2) Try copying an object (FlightConfiguration)
+        // 2) Copy a configuration object if exposed
         Object cfg = invokeObject(srcSim, "getFlightConfiguration");
         if (cfg == null) cfg = invokeObject(srcSim, "getActiveConfiguration");
         if (cfg == null) cfg = invokeObject(srcSim, "getSelectedConfiguration");
@@ -288,10 +367,10 @@ public final class MonteCarloBatchRunner {
             if (tryInvokeSetter(dstSim, "setSelectedConfiguration", cfg)) return;
         }
 
-        // 3) Try on SimulationOptions as a fallback
+        // 3) Try via options
         try {
-            SimulationOptions srcOpts = srcSim.getOptions();
-            SimulationOptions dstOpts = dstSim.getOptions();
+            Object srcOpts = invokeObject(srcSim, "getOptions");
+            Object dstOpts = invokeObject(dstSim, "getOptions");
             if (srcOpts != null && dstOpts != null) {
                 Object id2 = invokeObject(srcOpts, "getFlightConfigurationId");
                 if (id2 == null) id2 = invokeObject(srcOpts, "getMotorConfigurationID");
@@ -302,134 +381,380 @@ public final class MonteCarloBatchRunner {
                     if (tryInvokeSetter(dstOpts, "setMotorConfigurationId", id2)) return;
                 }
             }
-        } catch (Throwable ignored) {}
+        } catch (Throwable ignored) { }
+
         // 4) Last resort: copy selected configuration on the rocket itself
         try {
             Object srcRocket = invokeObject(srcSim, "getRocket");
             Object dstRocket = invokeObject(dstSim, "getRocket");
             if (srcRocket != null && dstRocket != null) {
                 Object sel = invokeObject(srcRocket, "getSelectedConfiguration");
-                if (sel != null) {
-                    tryInvokeSetter(dstRocket, "setSelectedConfiguration", sel);
-                }
+                if (sel != null) tryInvokeSetter(dstRocket, "setSelectedConfiguration", sel);
             }
-        } catch (Throwable ignored) {}
+        } catch (Throwable ignored) { }
     }
 
     // -------------------------------------------------------------------------
-    // WIND DEEP-COPY (OR 24.12 safe)
+    // WIND deep copy (fixes base-wind mutation + multi-level support)
     // -------------------------------------------------------------------------
 
-    /**
-     * OpenRocket 24.12 note:
-     * - Wind "model type" and scalar wind values often live under SimulationConditions.
-     * - MultiLevel wind profile lives under MultiLevelPinkNoiseWindModel (sometimes reachable from options, sometimes conditions).
-     *
-     * copySimulationOptionsFrom() does not reliably deep-copy wind fields when creating a new Simulation(doc, rocket),
-     * so we explicitly transfer wind fields here.
-     */
-    private static void copyWindSettings(SimulationOptions src, SimulationOptions dst) {
+    private static void deepCopyWindSettings(SimulationOptions src, SimulationOptions dst) {
         if (src == null || dst == null) return;
 
-        final SimulationConditions srcCond = getConditions(src);
-        final SimulationConditions dstCond = getConditions(dst);
+        final Object srcType = invokeObject(src, "getWindModelType");
+        final Object srcWindModelObj = invokeObject(src, "getWindModel");
 
-        // ---- 0) Copy wind model selector if API provides it (best-effort; reflection only) ----
-        // Prefer conditions.getWindModelType() -> conditions.setWindModelType(...)
-        // DO NOT copy the wind model instance object between simulations; it may hold state
-        // (pink-noise generator, cached profiles, etc.) and may not be safe to share.
-        if (srcCond != null && dstCond != null) {
-            // Some builds expose wind model type separately
-            Object srcWindModelType = invokeObject(srcCond, "getWindModelType");
-            if (srcWindModelType != null) {
-                tryInvokeSetter(dstCond, "setWindModelType", srcWindModelType);
+        boolean multiActive = false;
+        if (srcType != null) {
+            String s = String.valueOf(srcType).toLowerCase();
+            multiActive = (s.contains("multi") && s.contains("level"));
+        }
+        if (!multiActive && srcWindModelObj != null) {
+            String cls = srcWindModelObj.getClass().getName().toLowerCase();
+            if (cls.contains("multi") && cls.contains("level")) multiActive = true;
+        }
+
+        // Set type first (some OR builds key off this)
+        if (srcType != null) {
+            tryInvokeSetter(dst, "setWindModelType", srcType);
+        }
+
+        if (multiActive) {
+            // Imported wind profiles often use a multi-level model class OTHER than MultiLevelPinkNoiseWindModel.
+            Object srcMulti = invokeObject(src, "getMultiLevelWindModel");
+            if (srcMulti == null) srcMulti = srcWindModelObj;
+
+            if (srcMulti == null) {
+                log.warn("MC: Multi-level wind active but src model is null; dst may use defaults.");
+                return;
             }
-        }
 
-        // ---- 1) Copy scalar/average wind fields (prefer conditions; fallback to options) ----
-        Object srcScalar = (srcCond != null) ? srcCond : src;
-        Object dstScalar = (dstCond != null) ? dstCond : dst;
+            Object cloned = null;
 
-        // Speed & direction
-        copyDoubleIfPresent(srcScalar, dstScalar, "getWindSpeed", "setWindSpeed");
-        copyDoubleIfPresent(srcScalar, dstScalar, "getWindDirection", "setWindDirection");
-
-        // Std dev (name varies across OR builds)
-        if (!copyDoubleIfPresent(srcScalar, dstScalar, "getWindStandardDeviation", "setWindStandardDeviation")) {
-            copyDoubleIfPresent(srcScalar, dstScalar, "getWindSpeedStandardDeviation", "setWindSpeedStandardDeviation");
-        }
-
-        // Turbulence knobs (if present)
-        copyDoubleIfPresent(srcScalar, dstScalar, "getWindTurbulence", "setWindTurbulence");
-        copyDoubleIfPresent(srcScalar, dstScalar, "getWindTurbulenceIntensity", "setWindTurbulenceIntensity");
-
-        // ---- 2) Copy multi-level wind profile (if present) ----
-        MultiLevelPinkNoiseWindModel srcModel = resolveMultiLevelWindModel(src, srcCond);
-        MultiLevelPinkNoiseWindModel dstModel = resolveMultiLevelWindModel(dst, dstCond);
-
-        if (srcModel != null && dstModel != null) {
-            // Preferred: clearLevels() then addWindLevel(...)
-            boolean didClear = false;
-            try {
-                Method clear = dstModel.getClass().getMethod("clearLevels");
-                clear.invoke(dstModel);
-                didClear = true;
-            } catch (Exception ignored) { }
-
-            boolean hasAdd = hasMethod(dstModel, "addWindLevel", double.class, double.class, double.class, double.class);
-
-            if (didClear && hasAdd) {
-                for (MultiLevelPinkNoiseWindModel.LevelWindModel lvl : srcModel.getLevels()) {
-                    try {
-                        Method add = dstModel.getClass().getMethod(
-                                "addWindLevel", double.class, double.class, double.class, double.class
-                        );
-                        add.invoke(dstModel,
-                                lvl.getAltitude(),
-                                lvl.getSpeed(),
-                                lvl.getDirection(),
-                                lvl.getStandardDeviation()
-                        );
-                    } catch (Exception ignored) { }
-                }
+            // If it's the known OR class, keep the existing precise clone path
+            if (srcMulti instanceof MultiLevelPinkNoiseWindModel ml) {
+                cloned = cloneMultiLevel(ml);
             } else {
-                // Fallback: try to match existing dst levels by index and set values
-                List<MultiLevelPinkNoiseWindModel.LevelWindModel> srcLvls = srcModel.getLevels();
-                List<MultiLevelPinkNoiseWindModel.LevelWindModel> dstLvls = dstModel.getLevels();
-                int n = Math.min(srcLvls.size(), dstLvls.size());
-                for (int i = 0; i < n; i++) {
-                    MultiLevelPinkNoiseWindModel.LevelWindModel s = srcLvls.get(i);
-                    MultiLevelPinkNoiseWindModel.LevelWindModel d = dstLvls.get(i);
-                    try { d.setSpeed(s.getSpeed()); } catch (Throwable ignored) { }
-                    try { d.setDirection(s.getDirection()); } catch (Throwable ignored) { }
-                    try { d.setStandardDeviation(s.getStandardDeviation()); } catch (Throwable ignored) { }
-                    // altitude is often not mutable; ignore
+                // Generic deep clone for imported profiles
+                cloned = deepCloneGeneric(srcMulti);
+            }
+
+            boolean setOk = false;
+            if (cloned != null) {
+                setOk = tryInvokeSetter(dst, "setMultiLevelWindModel", cloned);
+                if (!setOk) setOk = tryInvokeSetter(dst, "setWindModel", cloned);
+            }
+
+            // Re-assert type after installing (guards against internal resets)
+            if (srcType != null) {
+                tryInvokeSetter(dst, "setWindModelType", srcType);
+            }
+
+            if (!setOk) {
+                // Last resort: attempt to copy level list into whatever dst already has
+                Object dstMulti = invokeObject(dst, "getMultiLevelWindModel");
+                if (dstMulti == null) dstMulti = invokeObject(dst, "getWindModel");
+
+                boolean copied = (dstMulti != null) && copyLevelsGeneric(srcMulti, dstMulti);
+                if (!copied) {
+                    log.warn("MC: Failed to copy imported multi-level wind profile (srcClass={}, type={}). Dst may fall back to defaults.",
+                            srcMulti.getClass().getName(),
+                            (srcType != null ? String.valueOf(srcType) : "null"));
                 }
             }
+            return;
+        }
+
+        // ---- Scalar wind ----
+        copyIfHas(src, dst, "getWindSpeed", "setWindSpeed");
+        copyIfHas(src, dst, "getAverageWindSpeed", "setAverageWindSpeed");
+        copyIfHas(src, dst, "getAverageWindspeed", "setAverageWindspeed");
+        copyIfHas(src, dst, "getWindDirection", "setWindDirection");
+        copyIfHas(src, dst, "getWindStandardDeviation", "setWindStandardDeviation");
+        copyIfHas(src, dst, "getWindSpeedStandardDeviation", "setWindSpeedStandardDeviation");
+
+        Object srcWM = invokeObject(src, "getWindModel");
+        Object dstWM = invokeObject(dst, "getWindModel");
+        if (srcWM != null && dstWM != null && srcWM == dstWM) {
+            Object clonedWM = cloneScalarWindModel(srcWM);
+            if (clonedWM != null) tryInvokeSetter(dst, "setWindModel", clonedWM);
         }
     }
 
-    private static SimulationConditions getConditions(SimulationOptions opts) {
-        if (opts == null) return null;
+    private static MultiLevelPinkNoiseWindModel resolveMultiLevelWindModel(Object opts, Object windModelObj) {
+        if (windModelObj instanceof MultiLevelPinkNoiseWindModel ml) return ml;
         try {
-            Method m = opts.getClass().getMethod("getConditions");
+            Method m = opts.getClass().getMethod("getMultiLevelWindModel");
             Object v = m.invoke(opts);
-            if (v instanceof SimulationConditions sc) return sc;
+            if (v instanceof MultiLevelPinkNoiseWindModel ml) return ml;
         } catch (Exception ignored) { }
         return null;
     }
 
-    private static MultiLevelPinkNoiseWindModel resolveMultiLevelWindModel(SimulationOptions opts, SimulationConditions cond) {
-        if (cond != null) {
-            Object maybe = invokeObject(cond, "getMultiLevelWindModel");
-            if (maybe instanceof MultiLevelPinkNoiseWindModel ml) return ml;
-        }
+    private static MultiLevelPinkNoiseWindModel cloneMultiLevel(MultiLevelPinkNoiseWindModel src) {
+        // 1) clone() if supported
         try {
-            return opts.getMultiLevelWindModel();
+            Method m = src.getClass().getMethod("clone");
+            Object v = m.invoke(src);
+            if (v instanceof MultiLevelPinkNoiseWindModel ml) return ml;
+        } catch (Exception ignored) { }
+
+        // 2) build new and copy levels
+        MultiLevelPinkNoiseWindModel dst = new MultiLevelPinkNoiseWindModel();
+        copyLevels(src, dst);
+        return dst;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void copyLevels(MultiLevelPinkNoiseWindModel src, MultiLevelPinkNoiseWindModel dst) {
+        if (src == null || dst == null) return;
+
+        // Try: dst.clearLevels()
+        try {
+            Method clear = dst.getClass().getMethod("clearLevels");
+            clear.invoke(dst);
+        } catch (Exception ignored) {
+            try {
+                List<?> lst = (List<?>) invokeObject(dst, "getLevels");
+                if (lst != null) lst.clear();
+            } catch (Exception ignored2) { }
+        }
+
+        for (MultiLevelPinkNoiseWindModel.LevelWindModel lvl : src.getLevels()) {
+            // Prefer: dst.addLevel(altitude) -> LevelWindModel
+            Object created = null;
+            try {
+                Method add = dst.getClass().getMethod("addLevel", double.class);
+                created = add.invoke(dst, lvl.getAltitude());
+            } catch (Exception ignored) { }
+
+            if (created instanceof MultiLevelPinkNoiseWindModel.LevelWindModel newLvl) {
+                newLvl.setSpeed(lvl.getSpeed());
+                newLvl.setDirection(lvl.getDirection());
+                try { newLvl.setStandardDeviation(lvl.getStandardDeviation()); } catch (Throwable ignored) { }
+                continue;
+            }
+
+            // Try: constructor LevelWindModel(double alt, double speed, double dir, double std)
+            try {
+                Class<?> cls = Class.forName("info.openrocket.core.models.wind.MultiLevelPinkNoiseWindModel$LevelWindModel");
+                for (Constructor<?> c : cls.getDeclaredConstructors()) {
+                    Class<?>[] p = c.getParameterTypes();
+                    if (p.length == 4 &&
+                            p[0] == double.class && p[1] == double.class && p[2] == double.class && p[3] == double.class) {
+                        c.setAccessible(true);
+                        Object obj = c.newInstance(lvl.getAltitude(), lvl.getSpeed(), lvl.getDirection(), lvl.getStandardDeviation());
+                        try {
+                            Method add2 = dst.getClass().getMethod("addLevel", cls);
+                            add2.invoke(dst, obj);
+                            created = obj;
+                            break;
+                        } catch (Exception ignored2) { }
+                    }
+                }
+            } catch (Exception ignored) { }
+
+            // Last resort: if we couldn't create, just skip (better than mutating shared refs)
+        }
+    }
+
+    private static Object cloneScalarWindModel(Object srcWM) {
+        if (srcWM == null) return null;
+
+        // clone()
+        try {
+            Method m = srcWM.getClass().getMethod("clone");
+            return m.invoke(srcWM);
+        } catch (Exception ignored) { }
+
+        // default constructor
+        try {
+            Constructor<?> c = srcWM.getClass().getDeclaredConstructor();
+            c.setAccessible(true);
+            Object dst = c.newInstance();
+
+            // Copy common scalar properties
+            copyIfHas(srcWM, dst, "getWindSpeed", "setWindSpeed");
+            copyIfHas(srcWM, dst, "getSpeed", "setSpeed");
+            copyIfHas(srcWM, dst, "getAverageWindSpeed", "setAverageWindSpeed");
+            copyIfHas(srcWM, dst, "getAverageWindspeed", "setAverageWindspeed");
+
+            copyIfHas(srcWM, dst, "getWindDirection", "setWindDirection");
+            copyIfHas(srcWM, dst, "getDirection", "setDirection");
+
+            copyIfHas(srcWM, dst, "getWindStandardDeviation", "setWindStandardDeviation");
+            copyIfHas(srcWM, dst, "getWindSpeedStandardDeviation", "setWindSpeedStandardDeviation");
+            copyIfHas(srcWM, dst, "getStandardDeviation", "setStandardDeviation");
+            copyIfHas(srcWM, dst, "getStdDev", "setStdDev");
+
+            return dst;
+        } catch (Exception ignored) { }
+
+        return null;
+    }
+
+    private static void copyIfHas(Object src, Object dst, String getter, String setter) {
+        try {
+            Method g = src.getClass().getMethod(getter);
+            Object v = g.invoke(src);
+            if (v == null) return;
+            tryInvokeSetter(dst, setter, v);
+        } catch (Exception ignored) { }
+    }
+
+    private static Object deepCloneGeneric(Object src) {
+        if (src == null) return null;
+
+        // 1) clone() if available
+        Object c = tryInvokeClone(src);
+        if (c != null) return c;
+
+        // 2) Java serialization deep clone if possible
+        c = trySerializeClone(src);
+        if (c != null) return c;
+
+        // 3) Reflective copy into new instance, with special handling for List fields
+        Object dst = tryNewInstance(src.getClass());
+        if (dst == null) return null;
+
+        copyFieldsWithListDeepCopy(src, dst);
+        return dst;
+    }
+
+    private static Object tryInvokeClone(Object src) {
+        try {
+            Method m;
+            try {
+                m = src.getClass().getMethod("clone");
+            } catch (NoSuchMethodException e) {
+                m = src.getClass().getDeclaredMethod("clone");
+                m.setAccessible(true);
+            }
+            Object out = m.invoke(src);
+            if (out != null && out != src) return out;
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    private static Object trySerializeClone(Object src) {
+        if (!(src instanceof Serializable)) return null;
+        try {
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            try (ObjectOutputStream oos = new ObjectOutputStream(bos)) {
+                oos.writeObject(src);
+            }
+            byte[] bytes = bos.toByteArray();
+            try (ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(bytes))) {
+                return ois.readObject();
+            }
         } catch (Throwable ignored) {
             return null;
         }
     }
+
+    private static Object tryNewInstance(Class<?> cls) {
+        try {
+            Constructor<?> c = cls.getDeclaredConstructor();
+            c.setAccessible(true);
+            return c.newInstance();
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static void copyFieldsWithListDeepCopy(Object src, Object dst) {
+        Class<?> c = src.getClass();
+        while (c != null && c != Object.class) {
+            for (Field f : c.getDeclaredFields()) {
+                if (Modifier.isStatic(f.getModifiers())) continue;
+                f.setAccessible(true);
+                try {
+                    Object v = f.get(src);
+                    if (v == null) continue;
+
+                    // If it's a list, deep-copy elements (levels!)
+                    if (v instanceof List<?> list) {
+                        List<Object> copy = new ArrayList<>(list.size());
+                        for (Object e : list) {
+                            Object ec = tryInvokeClone(e);
+                            if (ec == null) ec = trySerializeClone(e);
+                            if (ec == null) {
+                                Object ne = tryNewInstance(e.getClass());
+                                if (ne != null) {
+                                    copyFieldsShallow(e, ne);
+                                    ec = ne;
+                                } else {
+                                    ec = e; // last resort
+                                }
+                            }
+                            copy.add(ec);
+                        }
+                        f.set(dst, copy);
+                    } else {
+                        // Shallow for non-list fields (OK for primitives/immutable refs)
+                        f.set(dst, v);
+                    }
+                } catch (Throwable ignored) {}
+            }
+            c = c.getSuperclass();
+        }
+    }
+
+    private static void copyFieldsShallow(Object src, Object dst) {
+        Class<?> c = src.getClass();
+        while (c != null && c != Object.class) {
+            for (Field f : c.getDeclaredFields()) {
+                if (Modifier.isStatic(f.getModifiers())) continue;
+                f.setAccessible(true);
+                try { f.set(dst, f.get(src)); } catch (Throwable ignored) {}
+            }
+            c = c.getSuperclass();
+        }
+    }
+
+    @SuppressWarnings({"rawtypes","unchecked"})
+    private static boolean copyLevelsGeneric(Object srcMulti, Object dstMulti) {
+        // Try getLevels()
+        Object srcLevelsObj = invokeObject(srcMulti, "getLevels");
+        Object dstLevelsObj = invokeObject(dstMulti, "getLevels");
+        if (!(srcLevelsObj instanceof List srcLevels)) return false;
+
+        // If dst exposes a mutable list, replace contents
+        if (dstLevelsObj instanceof List dstLevels) {
+            try {
+                dstLevels.clear();
+                for (Object lvl : srcLevels) {
+                    Object lv2 = tryInvokeClone(lvl);
+                    if (lv2 == null) lv2 = trySerializeClone(lvl);
+                    if (lv2 == null) {
+                        Object ne = tryNewInstance(lvl.getClass());
+                        if (ne != null) { copyFieldsShallow(lvl, ne); lv2 = ne; }
+                        else lv2 = lvl;
+                    }
+                    dstLevels.add(lv2);
+                }
+                return true;
+            } catch (Throwable ignored) {}
+        }
+
+        // Otherwise try setLevels(List)
+        List<Object> clonedLevels = new ArrayList<>();
+        for (Object lvl : srcLevels) {
+            Object lv2 = tryInvokeClone(lvl);
+            if (lv2 == null) lv2 = trySerializeClone(lvl);
+            if (lv2 == null) {
+                Object ne = tryNewInstance(lvl.getClass());
+                if (ne != null) { copyFieldsShallow(lvl, ne); lv2 = ne; }
+                else lv2 = lvl;
+            }
+            clonedLevels.add(lv2);
+        }
+        return tryInvokeSetter(dstMulti, "setLevels", clonedLevels) || tryInvokeSetter(dstMulti, "setWindLevels", clonedLevels);
+    }
+
+    // -------------------------------------------------------------------------
+    // Generic reflection helpers
+    // -------------------------------------------------------------------------
 
     private static Object invokeObject(Object target, String methodName) {
         if (target == null) return null;
@@ -441,50 +766,42 @@ public final class MonteCarloBatchRunner {
         }
     }
 
-    private static boolean copyDoubleIfPresent(Object src, Object dst, String getterName, String setterName) {
-        try {
-            Method g = src.getClass().getMethod(getterName);
-            Object v = g.invoke(src);
-            if (!(v instanceof Number)) return false;
-            double d = ((Number) v).doubleValue();
-
-            Method s = dst.getClass().getMethod(setterName, double.class);
-            s.invoke(dst, d);
-            return true;
-        } catch (Exception ignored) {
-            return false;
-        }
-    }
-
-    private static boolean tryInvokeSetter(Object target, String setterName, Object value) {
-        if (target == null || value == null) return false;
-        try {
-            Method m = target.getClass().getMethod(setterName, value.getClass());
-            m.invoke(target, value);
-            return true;
-        } catch (Exception ignored) {
-            for (Method m : target.getClass().getMethods()) {
-                if (!m.getName().equals(setterName)) continue;
-                Class<?>[] p = m.getParameterTypes();
-                if (p.length != 1) continue;
-                if (p[0].isAssignableFrom(value.getClass())) {
-                    try {
-                        m.invoke(target, value);
-                        return true;
-                    } catch (Exception ignored2) { }
+    private static boolean tryInvokeSetter(Object target, String methodName, Object value) {
+        if (target == null || methodName == null) return false;
+        Method[] methods = target.getClass().getMethods();
+        for (Method m : methods) {
+            if (!m.getName().equals(methodName)) continue;
+            if (m.getParameterCount() != 1) continue;
+            Class<?> p = m.getParameterTypes()[0];
+            if (value == null) continue;
+            if (!p.isAssignableFrom(value.getClass())) {
+                // allow primitive boxing (double/int/long/boolean)
+                if (p.isPrimitive()) {
+                    if ((p == double.class && value instanceof Number) ||
+                        (p == int.class && value instanceof Number) ||
+                        (p == long.class && value instanceof Number) ||
+                        (p == boolean.class && value instanceof Boolean)) {
+                        // ok
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
                 }
             }
+            try {
+                if (p == double.class && value instanceof Number n) {
+                    m.invoke(target, n.doubleValue());
+                } else if (p == int.class && value instanceof Number n) {
+                    m.invoke(target, n.intValue());
+                } else if (p == long.class && value instanceof Number n) {
+                    m.invoke(target, n.longValue());
+                } else {
+                    m.invoke(target, value);
+                }
+                return true;
+            } catch (Exception ignored) { }
         }
         return false;
-    }
-
-    private static boolean hasMethod(Object target, String name, Class<?>... params) {
-        if (target == null) return false;
-        try {
-            target.getClass().getMethod(name, params);
-            return true;
-        } catch (Exception ignored) {
-            return false;
-        }
     }
 }

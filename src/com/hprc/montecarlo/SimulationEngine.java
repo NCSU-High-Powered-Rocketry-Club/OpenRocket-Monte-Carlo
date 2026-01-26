@@ -235,14 +235,17 @@ public class SimulationEngine {
     private void configureMonteCarloSimulationOptions(SimulationOptions opts) {
 
         for (MultiLevelPinkNoiseWindModel.LevelWindModel windLevel : opts.getMultiLevelWindModel().getLevels()) {
-            // Speed
-            double windSpeed = randomGauss(windLevel.getSpeed(), windLevel.getStandardDeviation());
-            windLevel.setSpeed(windSpeed);
-            log.debug("Cond @ {}: Avg WindSpeed: {}m/s", windLevel.getAltitude(), windSpeed);
+            // NOTE: In OpenRocket's multi-level wind model, "standard deviation" is the gust/turbulence amplitude
+            // used internally by the pink-noise generator. It is NOT intended to be used as a sigma to randomize the
+            // mean wind speed profile itself.
+            //
+            // Therefore we keep the imported/nominal mean speed as-is, and only randomize the direction here.
+            // If you want day-to-day mean speed dispersion, vary the *mean* wind speed separately (e.g., via the
+            // MonteCarloExtension's Wind Speed Average Sigma).
+            log.debug("Cond @ {}: Avg WindSpeed (mean): {}m/s", windLevel.getAltitude(), windLevel.getSpeed());
 
             // Direction
-            // OpenRocket stores direction in Radians. StdDev is provided in Degrees.
-            // We convert the Mean to Degrees, apply the Gaussian noise (in degrees), then convert back to Radians.
+            // OpenRocket stores direction in radians. StdDev here is provided in degrees.
             double meanDirDeg = Math.toDegrees(windLevel.getDirection());
             double windDirection = randomGauss(meanDirDeg, windDirStdDev);
             windLevel.setDirection(Math.toRadians(windDirection));

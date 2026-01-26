@@ -47,6 +47,10 @@ public final class SimulationData {
     public double landingDownrange_m;
     public double landingCrossrange_m;
 
+    public double maxVelocity_mps;
+    public double maxAcceleration_mps2;
+    public double flightTime_s;
+
     // Launch site used
     public double launchLat_deg;
     public double launchLon_deg;
@@ -94,6 +98,9 @@ public final class SimulationData {
         List<Double> posX = branch.get(FlightDataType.TYPE_POSITION_X);
         List<Double> posY = branch.get(FlightDataType.TYPE_POSITION_Y);
 
+        List<Double> velocity = branch.get(FlightDataType.TYPE_VELOCITY_TOTAL);
+        List<Double> accel = branch.get(FlightDataType.TYPE_ACCELERATION_TOTAL);
+
         // Validate lengths
         int n = min(time.size(), altitude.size(), posX.size(), posY.size());
         if (n <= 0) {
@@ -118,6 +125,11 @@ public final class SimulationData {
             out.apogee_m = altitude.get(iApo);
             out.hasApogee = true;
         }
+
+        // 4b) Basic scalars from time series
+        out.flightTime_s = time.get(n - 1);
+        out.maxVelocity_mps = maxFinite(velocity);
+        out.maxAcceleration_mps2 = maxFinite(accel);
 
         // 5) Determine landing time (GROUND_HIT) and pick nearest index
         Double landingTime = findEventTime(branch, FlightEvent.Type.GROUND_HIT);
@@ -250,5 +262,15 @@ public final class SimulationData {
             if (v < m) m = v;
         }
         return m;
+    }
+
+    private static double maxFinite(List<Double> values) {
+        if (values == null || values.isEmpty()) return Double.NaN;
+        double max = Double.NEGATIVE_INFINITY;
+        for (Double v : values) {
+            if (v == null || !Double.isFinite(v)) continue;
+            if (v > max) max = v;
+        }
+        return (max == Double.NEGATIVE_INFINITY) ? Double.NaN : max;
     }
 }
