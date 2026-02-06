@@ -149,12 +149,12 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
         // ---- Launch rail angle/direction (stored in radians in OR) ----
         if (launchRodAngleStdDevDeg > 0) {
             double base = opts.getLaunchRodAngle();
-            double varied = base + Math.toRadians(rng.nextGaussian() * launchRodAngleStdDevDeg);
+            double varied = base + rng.nextGaussian() * launchRodAngleStdDevDeg;            
             opts.setLaunchRodAngle(varied);
         }
         if (launchRodDirectionStdDevDeg > 0) {
             double base = opts.getLaunchRodDirection();
-            double varied = base + Math.toRadians(rng.nextGaussian() * launchRodDirectionStdDevDeg);
+            double varied = base + rng.nextGaussian() * launchRodDirectionStdDevDeg;            
             opts.setLaunchRodDirection(varied);
         }
 
@@ -191,8 +191,8 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
 
         final double avgSigmaMps  = Math.max(0.0, finiteOrZero(windSpeedAverageSigmaMps));
         final double turbSigmaMps = Math.max(0.0, finiteOrZero(windSpeedTurbulenceSigmaMps));
-        final double dirSigmaRad  = Math.toRadians(Math.max(0.0, finiteOrZero(windDirectionStdDevDeg)));
-
+        final double dirSigmaRad = Math.max(0.0, finiteOrZero(windDirectionStdDevDeg));
+        
         final boolean multiLevelActive = isMultiLevelActive(conditions, opts, windModel);
 
         if (multiLevelActive && (mlFromModel != null || mlCond != null || mlOpts != null)) {

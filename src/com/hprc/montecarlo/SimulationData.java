@@ -172,20 +172,12 @@ public final class SimulationData {
     /**
      * Helper to perform coordinate rotation and Lat/Lon conversion.
      */
-    private static void computeLandingENU(SimulationData out, double down, double cross) {
-        // Rotate down/cross -> ENU east/north using rod direction (clockwise from North)
-        double az = Math.toRadians(out.launchRodDirection_deg);
+    private static void computeLandingENU(SimulationData out, double posX, double posY) {
+        // OpenRocket 24.12: TYPE_POSITION_X = East, TYPE_POSITION_Y = North
+        // in the world ENU frame. No rotation needed.
+        out.landingEast_m  = posX;
+        out.landingNorth_m = posY;
 
-        // Rotation logic:
-        // Downrange (X) is along the azimuth.
-        // Crossrange (Y) is perpendicular (Right hand rule).
-        // East  = down * sin(az) + cross * cos(az)
-        // North = down * cos(az) - cross * sin(az)
-        out.landingEast_m = down * Math.sin(az) + cross * Math.cos(az);
-        out.landingNorth_m = down * Math.cos(az) - cross * Math.sin(az);
-
-        // 5c) Compute landing lat/lon (degrees) from ENU and launch site
-        // Uses the static helper from LandingDispersion6DOF
         double[] ll = LandingDispersion6DOF.enuToLatLonDeg(
                 out.landingEast_m,
                 out.landingNorth_m,

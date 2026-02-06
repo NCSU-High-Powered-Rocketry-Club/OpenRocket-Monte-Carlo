@@ -148,7 +148,7 @@ public final class SimulationRunner {
      */
     public static LandingInfo runAndExtractLanding(Simulation sim) throws Exception {
         runSimulationInProcess(sim);
-        return extractLanding(sim, 0, XYFrame.DOWNRANGE_CROSSRANGE);
+        return extractLanding(sim, 0, XYFrame.EAST_NORTH);
     }
 
     /**
