@@ -8,7 +8,6 @@ import info.openrocket.core.simulation.extension.AbstractSimulationExtension;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.HashSet;
 import java.util.Random;
@@ -18,6 +17,23 @@ import java.util.Set;
  * OpenRocket Simulation Extension entry point for the "HPRC Monte Carlo" plugin.
  *
  * Configured via the Simulation Extensions tab (MonteCarloConfigurator).
+ *
+ * <p><b>Persistence (run-to-run / .ork save-load):</b>
+ * OpenRocket persists a simulation extension's settings into the <code>.ork</code> file via the
+ * {@link AbstractSimulationExtension}-provided {@code config} object.
+ *
+ * <ul>
+ *   <li>Read values with the cfgXxx() helpers below.</li>
+ *   <li>Write values with the cfgPutXxx() helpers below.</li>
+ *   <li>After every UI-driven setter, call {@code fireChangeEvent()} so the Simulation is marked dirty
+ *       and the updated config is serialized into the <code>.ork</code>.</li>
+ * </ul>
+ *
+ * <p>
+ * IMPORTANT: do <b>not</b> cache the config values at construction time. OpenRocket may populate the
+ * extension's {@code config} after instantiation when loading a <code>.ork</code>; caching too early
+ * can cause saved values to be ignored. Therefore, getters read directly from {@code config}.
+ * </p>
  *
  * IMPORTANT BEHAVIOR:
  * - This extension must NOT mutate the user's base simulation when they click the normal "Run".
@@ -67,31 +83,162 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
     private static final String K_WORKER_THREADS = CFG_PREFIX + "workerThreads";
 
     // -------------------------------------------------------------------------
-    // Cached values (mirrors config for quick access)
+    // Defaults
     // -------------------------------------------------------------------------
 
-    private boolean enabled = true;
-    private boolean debugEnabled = false;
-    private int numberOfSimulations = 100;
+    private static final boolean D_ENABLED = true;
+    private static final boolean D_DEBUG = false;
+    private static final int D_NUM_SIMS = 100;
 
-    private boolean useDeterministicSeed = false;
-    private long randomSeed = 1L;
+    private static final boolean D_DETERMINISTIC = false;
+    private static final long D_RANDOM_SEED = 1L;
 
-    private double launchRodAngleStdDevDeg = 0.0;
-    private double launchRodDirectionStdDevDeg = 0.0;
+    private static final double D_ROD_ANGLE_SIGMA_DEG = 0.0;
+    private static final double D_ROD_DIR_SIGMA_DEG = 0.0;
 
-    private double launchLatitudeStdDevDeg = 0.0;
-    private double launchLongitudeStdDevDeg = 0.0;
-    private double launchAltitudeStdDevM = 0.0;
+    private static final double D_LAT_SIGMA_DEG = 0.0;
+    private static final double D_LON_SIGMA_DEG = 0.0;
+    private static final double D_ALT_SIGMA_M = 0.0;
 
-    private double windDirectionStdDevDeg = 0.0;
-    private double temperatureStdDevC = 0.0;
-    private double pressureStdDevMbar = 0.0;
+    private static final double D_WIND_DIR_SIGMA_DEG = 0.0;
+    private static final double D_TEMP_SIGMA_C = 0.0;
+    private static final double D_PRES_SIGMA_MBAR = 0.0;
 
-    private double windSpeedAverageSigmaMps = 0.0;
-    private double windSpeedTurbulenceSigmaMps = 0.0;
+    private static final double D_WIND_AVG_SIGMA_MPS = 0.0;
+    private static final double D_WIND_TURB_SIGMA_MPS = 0.0;
 
-    private int workerThreads = 1;
+    private static final int D_WORKER_THREADS = 1;
+
+    // -------------------------------------------------------------------------
+    // Config helpers (same pattern as AirbrakeExtension — read/write directly
+    // from the inherited `config` field, never cache)
+    // -------------------------------------------------------------------------
+
+    private static String safeString(String s) {
+        return (s == null) ? "" : s;
+    }
+
+    private Object invokeConfigGetRaw(String key) {
+        if (key == null) return null;
+        try {
+            Method m = config.getClass().getMethod("get", String.class);
+            return m.invoke(config, key);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private boolean invokeConfigPut(String key, Object value) {
+        if (key == null) return false;
+        try {
+            Method m = config.getClass().getMethod("put", String.class, Object.class);
+            m.invoke(config, key, value);
+            return true;
+        } catch (Exception ignored) {
+            // fall through
+        }
+        // Try primitive overloads if present
+        if (value instanceof Boolean b) {
+            try {
+                Method m = config.getClass().getMethod("put", String.class, boolean.class);
+                m.invoke(config, key, b.booleanValue());
+                return true;
+            } catch (Exception ignored) { }
+        }
+        if (value instanceof Number n) {
+            try {
+                Method m = config.getClass().getMethod("put", String.class, double.class);
+                m.invoke(config, key, n.doubleValue());
+                return true;
+            } catch (Exception ignored) { }
+        }
+        if (value instanceof String s) {
+            try {
+                Method m = config.getClass().getMethod("put", String.class, String.class);
+                m.invoke(config, key, s);
+                return true;
+            } catch (Exception ignored) { }
+        }
+        return false;
+    }
+
+    private double cfgDouble(String key, double fallback) {
+        Object v = invokeConfigGetRaw(key);
+        if (v instanceof Number n) return n.doubleValue();
+        if (v instanceof String s) {
+            try { return Double.parseDouble(s.trim()); } catch (Exception ignored) { }
+        }
+        try {
+            return config.getDouble(key, fallback);
+        } catch (Throwable ignored) {
+            return fallback;
+        }
+    }
+
+    private boolean cfgBool(String key, boolean fallback) {
+        Object v = invokeConfigGetRaw(key);
+        if (v instanceof Boolean b) return b;
+        if (v instanceof Number n) return n.doubleValue() != 0.0;
+        if (v instanceof String s) {
+            if ("true".equalsIgnoreCase(s) || "false".equalsIgnoreCase(s)) return Boolean.parseBoolean(s);
+            try { return Double.parseDouble(s.trim()) != 0.0; } catch (Exception ignored) { }
+        }
+        return fallback;
+    }
+
+    private int cfgInt(String key, int fallback) {
+        Object v = invokeConfigGetRaw(key);
+        if (v instanceof Number n) return n.intValue();
+        if (v instanceof String s) {
+            try { return Integer.parseInt(s.trim()); } catch (Exception ignored) { }
+            try { return (int) Math.round(Double.parseDouble(s.trim())); } catch (Exception ignored) { }
+        }
+        // Try getDouble as fallback (OR config often stores ints as doubles)
+        try {
+            double d = config.getDouble(key, Double.NaN);
+            if (Double.isFinite(d)) return (int) Math.round(d);
+        } catch (Throwable ignored) { }
+        return fallback;
+    }
+
+    private long cfgLong(String key, long fallback) {
+        Object v = invokeConfigGetRaw(key);
+        if (v instanceof Number n) return n.longValue();
+        if (v instanceof String s) {
+            try { return Long.parseLong(s.trim()); } catch (Exception ignored) { }
+            try { return (long) Math.round(Double.parseDouble(s.trim())); } catch (Exception ignored) { }
+        }
+        return fallback;
+    }
+
+    private void cfgPutDouble(String key, double value) {
+        if (invokeConfigPut(key, value)) return;
+        try { config.put(key, value); } catch (Throwable ignored) { }
+    }
+
+    private void cfgPutString(String key, String value) {
+        value = safeString(value);
+        if (invokeConfigPut(key, value)) return;
+        try { config.put(key, value); } catch (Throwable ignored) { }
+    }
+
+    private void cfgPutBool(String key, boolean value) {
+        if (invokeConfigPut(key, value)) return;
+        // As a last resort, store as string for max compatibility
+        cfgPutString(key, value ? "true" : "false");
+    }
+
+    private void cfgPutInt(String key, int value) {
+        // Store as double since OR's config typically supports put(String, double)
+        cfgPutDouble(key, (double) value);
+    }
+
+    private void cfgPutLong(String key, long value) {
+        // Prefer storing as String to avoid precision loss
+        if (invokeConfigPut(key, String.valueOf(value))) return;
+        if (invokeConfigPut(key, value)) return;
+        cfgPutString(key, String.valueOf(value));
+    }
 
     // -------------------------------------------------------------------------
     // Batch-only controls (NOT persisted)
@@ -116,10 +263,7 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
 
     @Override
     public void initialize(final SimulationConditions conditions) throws SimulationException {
-        // Refresh cached values from config map (so .ork persistence works even across reloads)
-        reloadFromConfig();
-
-        if (!enabled) return;
+        if (!isEnabled()) return;
 
         // CRITICAL: never perturb when user is running a normal single sim from the UI.
         // Only MonteCarloBatchRunner sets this true for cloned sims.
@@ -129,13 +273,18 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
         final SimulationOptions opts = resolveOptions(conditions);
 
         // Per-run RNG (batch runner provides seed; fallback to deterministic base or random)
+        final boolean useDeterministicSeed = isUseDeterministicSeed();
         final long seed = (batchSeed != Long.MIN_VALUE)
                 ? batchSeed
-                : (useDeterministicSeed ? randomSeed : new Random().nextLong());
+                : (useDeterministicSeed ? getRandomSeed() : new Random().nextLong());
         this.effectiveSeedUsed = seed;
         final Random rng = new Random(seed);
 
+        final boolean debugEnabled = isDebugEnabled();
+
         // ---- Atmosphere: if varying temp/pressure, disable ISA and ensure sane defaults ----
+        final double temperatureStdDevC = getTemperatureStdDevC();
+        final double pressureStdDevMbar = getPressureStdDevMbar();
         if ((temperatureStdDevC > 0.0 || pressureStdDevMbar > 0.0) && opts.isISAAtmosphere()) {
             opts.setISAAtmosphere(false);
         }
@@ -147,40 +296,38 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
         }
 
         // ---- Launch rail angle/direction (stored in radians in OR) ----
+        final double launchRodAngleStdDevDeg = getLaunchRodAngleStdDevDeg();
         if (launchRodAngleStdDevDeg > 0) {
             double base = opts.getLaunchRodAngle();
-            double varied = base + rng.nextGaussian() * launchRodAngleStdDevDeg;            
+            double varied = base + rng.nextGaussian() * launchRodAngleStdDevDeg;
             opts.setLaunchRodAngle(varied);
         }
+        final double launchRodDirectionStdDevDeg = getLaunchRodDirectionStdDevDeg();
         if (launchRodDirectionStdDevDeg > 0) {
             double base = opts.getLaunchRodDirection();
-            double varied = base + rng.nextGaussian() * launchRodDirectionStdDevDeg;            
+            double varied = base + rng.nextGaussian() * launchRodDirectionStdDevDeg;
             opts.setLaunchRodDirection(varied);
         }
 
         // ---- Launch coordinates ----
+        final double launchLatitudeStdDevDeg = getLaunchLatitudeStdDevDeg();
         if (launchLatitudeStdDevDeg > 0) {
             double base = opts.getLaunchLatitude();
             opts.setLaunchLatitude(clamp(base + rng.nextGaussian() * launchLatitudeStdDevDeg, -90.0, 90.0));
         }
+        final double launchLongitudeStdDevDeg = getLaunchLongitudeStdDevDeg();
         if (launchLongitudeStdDevDeg > 0) {
             double base = opts.getLaunchLongitude();
             opts.setLaunchLongitude(wrapLongitudeDeg(base + rng.nextGaussian() * launchLongitudeStdDevDeg));
         }
+        final double launchAltitudeStdDevM = getLaunchAltitudeStdDevM();
         if (launchAltitudeStdDevM > 0) {
             double base = opts.getLaunchAltitude();
             opts.setLaunchAltitude(Math.max(-500.0, base + rng.nextGaussian() * launchAltitudeStdDevM));
         }
 
         // ---------------------------------------------------------------------
-        // WIND (Average / PinkNoise / MultiLevelPinkNoise)
-        //
-        // Monte Carlo semantics:
-        // - windSpeedAverageSigmaMps: per-run perturbation to the MEAN wind speed
-        // - windSpeedTurbulenceSigmaMps: per-run perturbation to the GUST std-dev
-        // - windDirectionStdDevDeg: per-run perturbation to the direction (radians internal)
-        //
-        // Multi-level: apply ONE uniform delta to ALL levels (recommended).
+        // WIND
         // ---------------------------------------------------------------------
 
         final Object windModel = resolveWindModel(conditions, opts);
@@ -189,32 +336,29 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
         final MultiLevelPinkNoiseWindModel mlCond = getMultiLevelWindModelFromConditions(conditions);
         final MultiLevelPinkNoiseWindModel mlOpts = getMultiLevelWindModelFromOptions(opts);
 
-        final double avgSigmaMps  = Math.max(0.0, finiteOrZero(windSpeedAverageSigmaMps));
-        final double turbSigmaMps = Math.max(0.0, finiteOrZero(windSpeedTurbulenceSigmaMps));
-        final double dirSigmaRad = Math.max(0.0, finiteOrZero(windDirectionStdDevDeg));
-        
+        final double avgSigmaMps  = Math.max(0.0, finiteOrZero(getWindSpeedAverageSigmaMps()));
+        final double turbSigmaMps = Math.max(0.0, finiteOrZero(getWindSpeedTurbulenceSigmaMps()));
+        final double dirSigmaRad = Math.max(0.0, finiteOrZero(getWindDirectionStdDevDeg()));
+
         final boolean multiLevelActive = isMultiLevelActive(conditions, opts, windModel);
 
         if (multiLevelActive && (mlFromModel != null || mlCond != null || mlOpts != null)) {
-            // Uniform per-run deltas
             final double deltaSpeed = (avgSigmaMps > 0.0)  ? rng.nextGaussian() * avgSigmaMps  : 0.0;
             final double deltaTurb  = (turbSigmaMps > 0.0) ? rng.nextGaussian() * turbSigmaMps : 0.0;
             final double deltaDir   = (dirSigmaRad > 0.0)  ? rng.nextGaussian() * dirSigmaRad  : 0.0;
 
-            // Apply once per unique instance
             final Set<Object> seen = new HashSet<>();
             if (mlFromModel != null && seen.add(mlFromModel)) {
-                applyMultiLevelUniformDeltas(mlFromModel, deltaSpeed, deltaTurb, deltaDir, avgSigmaMps, turbSigmaMps, dirSigmaRad);
+                applyMultiLevelUniformDeltas(mlFromModel, deltaSpeed, deltaTurb, deltaDir, avgSigmaMps, turbSigmaMps, dirSigmaRad, debugEnabled);
             }
             if (mlCond != null && seen.add(mlCond)) {
-                applyMultiLevelUniformDeltas(mlCond, deltaSpeed, deltaTurb, deltaDir, avgSigmaMps, turbSigmaMps, dirSigmaRad);
+                applyMultiLevelUniformDeltas(mlCond, deltaSpeed, deltaTurb, deltaDir, avgSigmaMps, turbSigmaMps, dirSigmaRad, debugEnabled);
             }
             if (mlOpts != null && seen.add(mlOpts)) {
-                applyMultiLevelUniformDeltas(mlOpts, deltaSpeed, deltaTurb, deltaDir, avgSigmaMps, turbSigmaMps, dirSigmaRad);
+                applyMultiLevelUniformDeltas(mlOpts, deltaSpeed, deltaTurb, deltaDir, avgSigmaMps, turbSigmaMps, dirSigmaRad, debugEnabled);
             }
 
         } else {
-            // Scalar wind model: apply per-run perturbations to speed/std-dev/direction.
             if (avgSigmaMps > 0.0) {
                 double baseSpeed = getScalarWindSpeedMps(conditions, opts, windModel);
                 double variedSpeed = Math.max(0.0, baseSpeed + rng.nextGaussian() * avgSigmaMps);
@@ -241,10 +385,6 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
                 if (debugEnabled) log.debug("MC Wind(dir): base={} deg, sigma={} deg, varied={} deg",
                         Math.toDegrees(baseDir), Math.toDegrees(dirSigmaRad), Math.toDegrees(variedDir));
             }
-
-            // IMPORTANT:
-            // Do NOT set "turbulence intensity" here. In some OpenRocket builds, intensity is derived from
-            // std-dev and mean wind, and writing it can cause std-dev to be recomputed/overwritten.
         }
 
         // ---- Temperature / Pressure variations ----
@@ -272,14 +412,12 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
     // -------------------------------------------------------------------------
 
     private static SimulationOptions resolveOptions(SimulationConditions conditions) throws SimulationException {
-        // 1) conditions.getOptions()
         try {
             Method m = conditions.getClass().getMethod("getOptions");
             Object v = m.invoke(conditions);
             if (v instanceof SimulationOptions so) return so;
         } catch (Exception ignored) { }
 
-        // 2) conditions.getSimulation().getOptions()
         try {
             Method m = conditions.getClass().getMethod("getSimulation");
             Object sim = m.invoke(conditions);
@@ -329,13 +467,14 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
         return name.contains("multi") || name.contains("level");
     }
 
-    private void applyMultiLevelUniformDeltas(MultiLevelPinkNoiseWindModel ml,
+    private static void applyMultiLevelUniformDeltas(MultiLevelPinkNoiseWindModel ml,
                                              double deltaSpeed,
                                              double deltaTurb,
                                              double deltaDir,
                                              double avgSigmaMps,
                                              double turbSigmaMps,
-                                             double dirSigmaRad) {
+                                             double dirSigmaRad,
+                                             boolean debugEnabled) {
         if (ml == null) return;
 
         final boolean doSpeed = Double.isFinite(deltaSpeed) && Math.abs(deltaSpeed) > 0.0;
@@ -426,19 +565,16 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
     // Scalar setters
 
     private static void setScalarWindSpeedEverywhere(SimulationConditions conditions, SimulationOptions opts, Object windModel, double speedMps) {
-        // Conditions
         tryInvokeVoidDouble(conditions, "setWindSpeed", speedMps);
         tryInvokeVoidDouble(conditions, "setAverageWindSpeed", speedMps);
         tryInvokeVoidDouble(conditions, "setAverageWindspeed", speedMps);
         tryInvokeVoidDouble(conditions, "setWindSpeedAverage", speedMps);
 
-        // Options
         tryInvokeVoidDouble(opts, "setWindSpeed", speedMps);
         tryInvokeVoidDouble(opts, "setAverageWindSpeed", speedMps);
         tryInvokeVoidDouble(opts, "setAverageWindspeed", speedMps);
         tryInvokeVoidDouble(opts, "setWindSpeedAverage", speedMps);
 
-        // Model
         if (windModel != null) {
             tryInvokeVoidDouble(windModel, "setWindSpeed", speedMps);
             tryInvokeVoidDouble(windModel, "setSpeed", speedMps);
@@ -449,21 +585,18 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
     }
 
     private static void setScalarWindStdDevEverywhere(SimulationConditions conditions, SimulationOptions opts, Object windModel, double stdMps) {
-        // Conditions
         tryInvokeVoidDouble(conditions, "setWindStandardDeviation", stdMps);
         tryInvokeVoidDouble(conditions, "setWindSpeedStandardDeviation", stdMps);
         tryInvokeVoidDouble(conditions, "setStandardDeviation", stdMps);
         tryInvokeVoidDouble(conditions, "setStdDev", stdMps);
         tryInvokeVoidDouble(conditions, "setTurbulence", stdMps);
 
-        // Options
         tryInvokeVoidDouble(opts, "setWindStandardDeviation", stdMps);
         tryInvokeVoidDouble(opts, "setWindSpeedStandardDeviation", stdMps);
         tryInvokeVoidDouble(opts, "setStandardDeviation", stdMps);
         tryInvokeVoidDouble(opts, "setStdDev", stdMps);
         tryInvokeVoidDouble(opts, "setTurbulence", stdMps);
 
-        // Model
         if (windModel != null) {
             tryInvokeVoidDouble(windModel, "setStandardDeviation", stdMps);
             tryInvokeVoidDouble(windModel, "setStdDev", stdMps);
@@ -473,17 +606,14 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
     }
 
     private static void setScalarWindDirectionEverywhere(SimulationConditions conditions, SimulationOptions opts, Object windModel, double dirRad) {
-        // Conditions
         tryInvokeVoidDouble(conditions, "setWindDirection", dirRad);
         tryInvokeVoidDouble(conditions, "setWindDirectionRad", dirRad);
         tryInvokeVoidDouble(conditions, "setDirection", dirRad);
 
-        // Options
         tryInvokeVoidDouble(opts, "setWindDirection", dirRad);
         tryInvokeVoidDouble(opts, "setWindDirectionRad", dirRad);
         tryInvokeVoidDouble(opts, "setDirection", dirRad);
 
-        // Model
         if (windModel != null) {
             tryInvokeVoidDouble(windModel, "setWindDirection", dirRad);
             tryInvokeVoidDouble(windModel, "setDirection", dirRad);
@@ -530,265 +660,6 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
     }
 
     // -------------------------------------------------------------------------
-    // Persistence: bridge to AbstractSimulationExtension config map (reflection)
-    // -------------------------------------------------------------------------
-
-    private void reloadFromConfig() {
-        // If we can't access config, keep cached values.
-        Object cfg = getCfgObject();
-        if (cfg == null) return;
-
-        enabled = cfgGetBool(cfg, K_ENABLED, enabled);
-        debugEnabled = cfgGetBool(cfg, K_DEBUG, debugEnabled);
-        numberOfSimulations = cfgGetInt(cfg, K_NUM_SIMS, numberOfSimulations);
-
-        useDeterministicSeed = cfgGetBool(cfg, K_DETERMINISTIC, useDeterministicSeed);
-        randomSeed = cfgGetLong(cfg, K_RANDOM_SEED, randomSeed);
-
-        launchRodAngleStdDevDeg = cfgGetDouble(cfg, K_ROD_ANGLE_SIGMA_DEG, launchRodAngleStdDevDeg);
-        launchRodDirectionStdDevDeg = cfgGetDouble(cfg, K_ROD_DIR_SIGMA_DEG, launchRodDirectionStdDevDeg);
-
-        launchLatitudeStdDevDeg = cfgGetDouble(cfg, K_LAT_SIGMA_DEG, launchLatitudeStdDevDeg);
-        launchLongitudeStdDevDeg = cfgGetDouble(cfg, K_LON_SIGMA_DEG, launchLongitudeStdDevDeg);
-        launchAltitudeStdDevM = cfgGetDouble(cfg, K_ALT_SIGMA_M, launchAltitudeStdDevM);
-
-        windDirectionStdDevDeg = cfgGetDouble(cfg, K_WIND_DIR_SIGMA_DEG, windDirectionStdDevDeg);
-        temperatureStdDevC = cfgGetDouble(cfg, K_TEMP_SIGMA_C, temperatureStdDevC);
-        pressureStdDevMbar = cfgGetDouble(cfg, K_PRES_SIGMA_MBAR, pressureStdDevMbar);
-
-        windSpeedAverageSigmaMps = cfgGetDouble(cfg, K_WIND_AVG_SIGMA_MPS, windSpeedAverageSigmaMps);
-        windSpeedTurbulenceSigmaMps = cfgGetDouble(cfg, K_WIND_TURB_SIGMA_MPS, windSpeedTurbulenceSigmaMps);
-
-        workerThreads = cfgGetInt(cfg, K_WORKER_THREADS, workerThreads);
-        if (workerThreads < 1) workerThreads = 1;
-        if (numberOfSimulations < 1) numberOfSimulations = 1;
-    }
-
-    private void storeToConfig(String key, Object value) {
-        Object cfg = getCfgObject();
-        if (cfg == null || key == null) return;
-
-        // Prefer storing long values as String to avoid any precision loss across implementations.
-        if (value instanceof Long l) {
-            if (invokeConfigPut(cfg, key, String.valueOf(l))) return;
-        }
-
-        // Try best-effort put with overloads (Object + primitives), then fall back to set*/put* variants.
-        if (invokeConfigPut(cfg, key, value)) return;
-
-        // Some OR builds expose "set(key, value)" instead of "put(key, value)".
-        try {
-            Method m = cfg.getClass().getMethod("set", String.class, Object.class);
-            m.invoke(cfg, key, value);
-            return;
-        } catch (Exception ignored) { }
-
-        // Some builds expose only String setters.
-        try {
-            Method m = cfg.getClass().getMethod("set", String.class, String.class);
-            m.invoke(cfg, key, String.valueOf(value));
-            return;
-        } catch (Exception ignored) { }
-
-        try {
-            Method m = cfg.getClass().getMethod("setString", String.class, String.class);
-            m.invoke(cfg, key, String.valueOf(value));
-        } catch (Exception ignored) { }
-    }
-
-    private Object getCfgObject() {
-        // 1) Look for a no-arg getConfig()/getConfiguration() method anywhere in the class hierarchy
-        for (Class<?> c = this.getClass(); c != null; c = c.getSuperclass()) {
-            try {
-                Method m = c.getDeclaredMethod("getConfig");
-                m.setAccessible(true);
-                Object v = m.invoke(this);
-                if (v != null) return v;
-            } catch (Exception ignored) { }
-            try {
-                Method m = c.getDeclaredMethod("getConfiguration");
-                m.setAccessible(true);
-                Object v = m.invoke(this);
-                if (v != null) return v;
-            } catch (Exception ignored) { }
-        }
-
-        // 2) Search for a protected field named "config" in the superclass chain.
-        for (Class<?> c = this.getClass(); c != null; c = c.getSuperclass()) {
-            try {
-                Field f = c.getDeclaredField("config");
-                f.setAccessible(true);
-                Object v = f.get(this);
-                if (v != null) return v;
-            } catch (Exception ignored) { }
-        }
-        return null;
-    }
-
-    private static Object invokeConfigGet(Object cfg, String key) {
-        if (cfg == null || key == null) return null;
-
-        // get(key)
-        try {
-            Method m = cfg.getClass().getMethod("get", String.class);
-            return m.invoke(cfg, key);
-        } catch (Exception ignored) { }
-
-        // getString(key)
-        try {
-            Method m = cfg.getClass().getMethod("getString", String.class);
-            return m.invoke(cfg, key);
-        } catch (Exception ignored) { }
-
-        return null;
-    }
-
-    private static boolean invokeConfigPut(Object cfg, String key, Object value) {
-        if (cfg == null || key == null) return false;
-
-        // put(String, <exact class>)
-        if (value != null) {
-            try {
-                Method m = cfg.getClass().getMethod("put", String.class, value.getClass());
-                m.invoke(cfg, key, value);
-                return true;
-            } catch (Exception ignored) { }
-        }
-
-        // put(String, Object)
-        try {
-            Method m = cfg.getClass().getMethod("put", String.class, Object.class);
-            m.invoke(cfg, key, value);
-            return true;
-        } catch (Exception ignored) { }
-
-        // Primitive overloads (common in OR config impls)
-        if (value instanceof Boolean b) {
-            try {
-                Method m = cfg.getClass().getMethod("put", String.class, boolean.class);
-                m.invoke(cfg, key, b.booleanValue());
-                return true;
-            } catch (Exception ignored) { }
-        }
-        if (value instanceof Integer i) {
-            try {
-                Method m = cfg.getClass().getMethod("put", String.class, int.class);
-                m.invoke(cfg, key, i.intValue());
-                return true;
-            } catch (Exception ignored) { }
-        }
-        if (value instanceof Long l) {
-            try {
-                Method m = cfg.getClass().getMethod("put", String.class, long.class);
-                m.invoke(cfg, key, l.longValue());
-                return true;
-            } catch (Exception ignored) { }
-        }
-        if (value instanceof Number n) {
-            try {
-                Method m = cfg.getClass().getMethod("put", String.class, double.class);
-                m.invoke(cfg, key, n.doubleValue());
-                return true;
-            } catch (Exception ignored) { }
-        }
-        if (value instanceof String s) {
-            try {
-                Method m = cfg.getClass().getMethod("put", String.class, String.class);
-                m.invoke(cfg, key, s);
-                return true;
-            } catch (Exception ignored) { }
-        }
-
-        return false;
-    }
-
-    private static String cfgGetString(Object cfg, String key, String fallback) {
-        Object v = invokeConfigGet(cfg, key);
-        if (v == null) {
-            // getString(key, fallback) (present in some builds)
-            try {
-                Method m = cfg.getClass().getMethod("getString", String.class, String.class);
-                Object out = m.invoke(cfg, key, fallback);
-                return (out != null) ? out.toString() : fallback;
-            } catch (Exception ignored) { }
-            return fallback;
-        }
-        return v.toString();
-    }
-
-    private static boolean cfgGetBool(Object cfg, String key, boolean fallback) {
-        Object v = invokeConfigGet(cfg, key);
-        if (v instanceof Boolean b) return b;
-        if (v instanceof Number n) return n.doubleValue() != 0.0;
-
-        // getBoolean(key, fallback)
-        try {
-            Method m = cfg.getClass().getMethod("getBoolean", String.class, boolean.class);
-            Object out = m.invoke(cfg, key, fallback);
-            if (out instanceof Boolean b) return b;
-        } catch (Exception ignored) { }
-
-        String s = (v != null) ? v.toString() : cfgGetString(cfg, key, null);
-        if (s == null) return fallback;
-        if ("true".equalsIgnoreCase(s) || "false".equalsIgnoreCase(s)) return Boolean.parseBoolean(s);
-        try { return Double.parseDouble(s.trim()) != 0.0; } catch (Exception ignored) { }
-        return fallback;
-    }
-
-    private static int cfgGetInt(Object cfg, String key, int fallback) {
-        Object v = invokeConfigGet(cfg, key);
-        if (v instanceof Number n) return n.intValue();
-
-        // getInt(key, fallback)
-        try {
-            Method m = cfg.getClass().getMethod("getInt", String.class, int.class);
-            Object out = m.invoke(cfg, key, fallback);
-            if (out instanceof Number n) return n.intValue();
-        } catch (Exception ignored) { }
-
-        String s = (v != null) ? v.toString() : cfgGetString(cfg, key, null);
-        if (s == null) return fallback;
-        try { return Integer.parseInt(s.trim()); } catch (Exception ignored) { }
-        try { return (int) Math.round(Double.parseDouble(s.trim())); } catch (Exception ignored) { }
-        return fallback;
-    }
-
-    private static long cfgGetLong(Object cfg, String key, long fallback) {
-        Object v = invokeConfigGet(cfg, key);
-        if (v instanceof Number n) return n.longValue();
-
-        // getLong(key, fallback)
-        try {
-            Method m = cfg.getClass().getMethod("getLong", String.class, long.class);
-            Object out = m.invoke(cfg, key, fallback);
-            if (out instanceof Number n) return n.longValue();
-        } catch (Exception ignored) { }
-
-        String s = (v != null) ? v.toString() : cfgGetString(cfg, key, null);
-        if (s == null) return fallback;
-        try { return Long.parseLong(s.trim()); } catch (Exception ignored) { }
-        try { return (long) Math.round(Double.parseDouble(s.trim())); } catch (Exception ignored) { }
-        return fallback;
-    }
-
-    private static double cfgGetDouble(Object cfg, String key, double fallback) {
-        // getDouble(key, fallback) (present in OR's config impls)
-        try {
-            Method m = cfg.getClass().getMethod("getDouble", String.class, double.class);
-            Object out = m.invoke(cfg, key, fallback);
-            if (out instanceof Number n) return n.doubleValue();
-        } catch (Exception ignored) { }
-
-        Object v = invokeConfigGet(cfg, key);
-        if (v instanceof Number n) return n.doubleValue();
-
-        String s = (v != null) ? v.toString() : cfgGetString(cfg, key, null);
-        if (s == null) return fallback;
-        try { return Double.parseDouble(s.trim()); } catch (Exception ignored) { return fallback; }
-    }
-
-
-    // -------------------------------------------------------------------------
     // Metadata
     // -------------------------------------------------------------------------
 
@@ -804,110 +675,151 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
 
     // -------------------------------------------------------------------------
     // Bean properties used by configurator
-    // (setters also persist to config)
+    // Every getter reads directly from config (never cached).
+    // Every setter: (1) writes to persisted config, (2) calls fireChangeEvent().
     // -------------------------------------------------------------------------
 
-    public boolean isEnabled() { reloadFromConfig(); return enabled; }
-    public void setEnabled(boolean v) { enabled = v; storeToConfig(K_ENABLED, v); fireChangeEvent(); }
+    public boolean isEnabled() {
+        return cfgBool(K_ENABLED, D_ENABLED);
+    }
 
-    public boolean isDebugEnabled() { reloadFromConfig(); return debugEnabled; }
-    public void setDebugEnabled(boolean v) { debugEnabled = v; storeToConfig(K_DEBUG, v); fireChangeEvent(); }
+    public void setEnabled(boolean v) {
+        cfgPutBool(K_ENABLED, v);
+        fireChangeEvent();
+    }
 
-    public int getNumberOfSimulations() { reloadFromConfig(); return numberOfSimulations; }
+    public boolean isDebugEnabled() {
+        return cfgBool(K_DEBUG, D_DEBUG);
+    }
+
+    public void setDebugEnabled(boolean v) {
+        cfgPutBool(K_DEBUG, v);
+        fireChangeEvent();
+    }
+
+    public int getNumberOfSimulations() {
+        return Math.max(1, cfgInt(K_NUM_SIMS, D_NUM_SIMS));
+    }
+
     public void setNumberOfSimulations(int v) {
-        numberOfSimulations = Math.max(1, v);
-        storeToConfig(K_NUM_SIMS, numberOfSimulations);
+        cfgPutInt(K_NUM_SIMS, Math.max(1, v));
         fireChangeEvent();
     }
 
-    public boolean isUseDeterministicSeed() { reloadFromConfig(); return useDeterministicSeed; }
+    public boolean isUseDeterministicSeed() {
+        return cfgBool(K_DETERMINISTIC, D_DETERMINISTIC);
+    }
+
     public void setUseDeterministicSeed(boolean v) {
-        useDeterministicSeed = v;
-        storeToConfig(K_DETERMINISTIC, v);
+        cfgPutBool(K_DETERMINISTIC, v);
         fireChangeEvent();
     }
 
-    public long getRandomSeed() { reloadFromConfig(); return randomSeed; }
+    public long getRandomSeed() {
+        return cfgLong(K_RANDOM_SEED, D_RANDOM_SEED);
+    }
+
     public void setRandomSeed(long v) {
-        randomSeed = v;
-        storeToConfig(K_RANDOM_SEED, v);
+        cfgPutLong(K_RANDOM_SEED, v);
         fireChangeEvent();
     }
 
-    public double getLaunchRodAngleStdDevDeg() { reloadFromConfig(); return launchRodAngleStdDevDeg; }
+    public double getLaunchRodAngleStdDevDeg() {
+        return Math.max(0.0, finiteOrZero(cfgDouble(K_ROD_ANGLE_SIGMA_DEG, D_ROD_ANGLE_SIGMA_DEG)));
+    }
+
     public void setLaunchRodAngleStdDevDeg(double v) {
-        launchRodAngleStdDevDeg = Math.max(0.0, finiteOrZero(v));
-        storeToConfig(K_ROD_ANGLE_SIGMA_DEG, launchRodAngleStdDevDeg);
+        cfgPutDouble(K_ROD_ANGLE_SIGMA_DEG, Math.max(0.0, finiteOrZero(v)));
         fireChangeEvent();
     }
 
-    public double getLaunchRodDirectionStdDevDeg() { reloadFromConfig(); return launchRodDirectionStdDevDeg; }
+    public double getLaunchRodDirectionStdDevDeg() {
+        return Math.max(0.0, finiteOrZero(cfgDouble(K_ROD_DIR_SIGMA_DEG, D_ROD_DIR_SIGMA_DEG)));
+    }
+
     public void setLaunchRodDirectionStdDevDeg(double v) {
-        launchRodDirectionStdDevDeg = Math.max(0.0, finiteOrZero(v));
-        storeToConfig(K_ROD_DIR_SIGMA_DEG, launchRodDirectionStdDevDeg);
+        cfgPutDouble(K_ROD_DIR_SIGMA_DEG, Math.max(0.0, finiteOrZero(v)));
         fireChangeEvent();
     }
 
-    public double getLaunchLatitudeStdDevDeg() { reloadFromConfig(); return launchLatitudeStdDevDeg; }
+    public double getLaunchLatitudeStdDevDeg() {
+        return Math.max(0.0, finiteOrZero(cfgDouble(K_LAT_SIGMA_DEG, D_LAT_SIGMA_DEG)));
+    }
+
     public void setLaunchLatitudeStdDevDeg(double v) {
-        launchLatitudeStdDevDeg = Math.max(0.0, finiteOrZero(v));
-        storeToConfig(K_LAT_SIGMA_DEG, launchLatitudeStdDevDeg);
+        cfgPutDouble(K_LAT_SIGMA_DEG, Math.max(0.0, finiteOrZero(v)));
         fireChangeEvent();
     }
 
-    public double getLaunchLongitudeStdDevDeg() { reloadFromConfig(); return launchLongitudeStdDevDeg; }
+    public double getLaunchLongitudeStdDevDeg() {
+        return Math.max(0.0, finiteOrZero(cfgDouble(K_LON_SIGMA_DEG, D_LON_SIGMA_DEG)));
+    }
+
     public void setLaunchLongitudeStdDevDeg(double v) {
-        launchLongitudeStdDevDeg = Math.max(0.0, finiteOrZero(v));
-        storeToConfig(K_LON_SIGMA_DEG, launchLongitudeStdDevDeg);
+        cfgPutDouble(K_LON_SIGMA_DEG, Math.max(0.0, finiteOrZero(v)));
         fireChangeEvent();
     }
 
-    public double getLaunchAltitudeStdDevM() { reloadFromConfig(); return launchAltitudeStdDevM; }
+    public double getLaunchAltitudeStdDevM() {
+        return Math.max(0.0, finiteOrZero(cfgDouble(K_ALT_SIGMA_M, D_ALT_SIGMA_M)));
+    }
+
     public void setLaunchAltitudeStdDevM(double v) {
-        launchAltitudeStdDevM = Math.max(0.0, finiteOrZero(v));
-        storeToConfig(K_ALT_SIGMA_M, launchAltitudeStdDevM);
+        cfgPutDouble(K_ALT_SIGMA_M, Math.max(0.0, finiteOrZero(v)));
         fireChangeEvent();
     }
 
-    public double getWindSpeedAverageSigmaMps() { reloadFromConfig(); return windSpeedAverageSigmaMps; }
+    public double getWindSpeedAverageSigmaMps() {
+        return Math.max(0.0, finiteOrZero(cfgDouble(K_WIND_AVG_SIGMA_MPS, D_WIND_AVG_SIGMA_MPS)));
+    }
+
     public void setWindSpeedAverageSigmaMps(double v) {
-        windSpeedAverageSigmaMps = Math.max(0.0, finiteOrZero(v));
-        storeToConfig(K_WIND_AVG_SIGMA_MPS, windSpeedAverageSigmaMps);
+        cfgPutDouble(K_WIND_AVG_SIGMA_MPS, Math.max(0.0, finiteOrZero(v)));
         fireChangeEvent();
     }
 
-    public double getWindSpeedTurbulenceSigmaMps() { reloadFromConfig(); return windSpeedTurbulenceSigmaMps; }
+    public double getWindSpeedTurbulenceSigmaMps() {
+        return Math.max(0.0, finiteOrZero(cfgDouble(K_WIND_TURB_SIGMA_MPS, D_WIND_TURB_SIGMA_MPS)));
+    }
+
     public void setWindSpeedTurbulenceSigmaMps(double v) {
-        windSpeedTurbulenceSigmaMps = Math.max(0.0, finiteOrZero(v));
-        storeToConfig(K_WIND_TURB_SIGMA_MPS, windSpeedTurbulenceSigmaMps);
+        cfgPutDouble(K_WIND_TURB_SIGMA_MPS, Math.max(0.0, finiteOrZero(v)));
         fireChangeEvent();
     }
 
-    public double getWindDirectionStdDevDeg() { reloadFromConfig(); return windDirectionStdDevDeg; }
+    public double getWindDirectionStdDevDeg() {
+        return Math.max(0.0, finiteOrZero(cfgDouble(K_WIND_DIR_SIGMA_DEG, D_WIND_DIR_SIGMA_DEG)));
+    }
+
     public void setWindDirectionStdDevDeg(double v) {
-        windDirectionStdDevDeg = Math.max(0.0, finiteOrZero(v));
-        storeToConfig(K_WIND_DIR_SIGMA_DEG, windDirectionStdDevDeg);
+        cfgPutDouble(K_WIND_DIR_SIGMA_DEG, Math.max(0.0, finiteOrZero(v)));
         fireChangeEvent();
     }
 
-    public double getTemperatureStdDevC() { reloadFromConfig(); return temperatureStdDevC; }
+    public double getTemperatureStdDevC() {
+        return Math.max(0.0, finiteOrZero(cfgDouble(K_TEMP_SIGMA_C, D_TEMP_SIGMA_C)));
+    }
+
     public void setTemperatureStdDevC(double v) {
-        temperatureStdDevC = Math.max(0.0, finiteOrZero(v));
-        storeToConfig(K_TEMP_SIGMA_C, temperatureStdDevC);
+        cfgPutDouble(K_TEMP_SIGMA_C, Math.max(0.0, finiteOrZero(v)));
         fireChangeEvent();
     }
 
-    public double getPressureStdDevMbar() { reloadFromConfig(); return pressureStdDevMbar; }
+    public double getPressureStdDevMbar() {
+        return Math.max(0.0, finiteOrZero(cfgDouble(K_PRES_SIGMA_MBAR, D_PRES_SIGMA_MBAR)));
+    }
+
     public void setPressureStdDevMbar(double v) {
-        pressureStdDevMbar = Math.max(0.0, finiteOrZero(v));
-        storeToConfig(K_PRES_SIGMA_MBAR, pressureStdDevMbar);
+        cfgPutDouble(K_PRES_SIGMA_MBAR, Math.max(0.0, finiteOrZero(v)));
         fireChangeEvent();
     }
 
-    public int getWorkerThreads() { reloadFromConfig(); return workerThreads; }
+    public int getWorkerThreads() {
+        return Math.max(1, cfgInt(K_WORKER_THREADS, D_WORKER_THREADS));
+    }
+
     public void setWorkerThreads(int v) {
-        workerThreads = Math.max(1, v);
-        storeToConfig(K_WORKER_THREADS, workerThreads);
+        cfgPutInt(K_WORKER_THREADS, Math.max(1, v));
         fireChangeEvent();
     }
 

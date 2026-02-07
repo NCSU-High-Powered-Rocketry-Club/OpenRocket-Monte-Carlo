@@ -65,7 +65,10 @@ public class MonteCarloConfigurator
 
         panel.add(new JLabel("Number of simulations"), "align label");
         JSpinner nSpinner = new JSpinner(new SpinnerNumberModel(
-                ext.getNumberOfSimulations(), 1, 1_000_000, 1));
+                (Number) Integer.valueOf(ext.getNumberOfSimulations()),
+                (Comparable<Integer>) Integer.valueOf(1),
+                (Comparable<Integer>) Integer.valueOf(1_000_000),
+                (Number) Integer.valueOf(1)));
         nSpinner.setEditor(new SpinnerEditor(nSpinner));
         nSpinner.addChangeListener(e -> ext.setNumberOfSimulations(((Number) nSpinner.getValue()).intValue()));
         panel.add(nSpinner, "span 2, growx");
@@ -135,9 +138,13 @@ public class MonteCarloConfigurator
 
         // Worker threads selector (JVM threads)
         panel.add(new JLabel("Worker threads"), "align label");
-        int maxThreads = Math.max(1, Runtime.getRuntime().availableProcessors());
+        int maxThreads = Math.max(4, Runtime.getRuntime().availableProcessors());
         int initialThreads = Math.min(Math.max(1, ext.getWorkerThreads()), maxThreads);
-        JSpinner threadsSpinner = new JSpinner(new SpinnerNumberModel(initialThreads, 1, maxThreads, 1));
+        JSpinner threadsSpinner = new JSpinner(new SpinnerNumberModel(
+                (Number) Integer.valueOf(initialThreads),
+                (Comparable<Integer>) Integer.valueOf(1),
+                (Comparable<Integer>) Integer.valueOf(maxThreads),
+                (Number) Integer.valueOf(1)));
         threadsSpinner.setEditor(new SpinnerEditor(threadsSpinner));
         threadsSpinner.addChangeListener(e -> ext.setWorkerThreads(((Number) threadsSpinner.getValue()).intValue()));
         panel.add(threadsSpinner, "span 2, growx");
