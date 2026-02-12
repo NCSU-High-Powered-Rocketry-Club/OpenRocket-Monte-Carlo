@@ -82,6 +82,25 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
 
     private static final String K_WORKER_THREADS = CFG_PREFIX + "workerThreads";
 
+    // ---------------------------------------------------------------------
+    // Gust / Shear disturbance keys (per-step wind deltas)
+    // ---------------------------------------------------------------------
+
+    private static final String K_GUST_ENABLED          = CFG_PREFIX + "gustEventsEnabled";
+    private static final String K_GUST_COUNT            = CFG_PREFIX + "gustEventCount";
+    private static final String K_GUST_WINDOW_START_S   = CFG_PREFIX + "gustWindowStartS";
+    private static final String K_GUST_WINDOW_END_S     = CFG_PREFIX + "gustWindowEndS";
+    private static final String K_GUST_DURATION_MEAN_S  = CFG_PREFIX + "gustDurationMeanS";
+    private static final String K_GUST_DURATION_SIGMA_S = CFG_PREFIX + "gustDurationSigmaS";
+    private static final String K_GUST_PEAK_MEAN_MPS    = CFG_PREFIX + "gustPeakDeltaMeanMps";
+    private static final String K_GUST_PEAK_SIGMA_MPS   = CFG_PREFIX + "gustPeakDeltaSigmaMps";
+
+    private static final String K_SHEAR_ENABLED         = CFG_PREFIX + "shearLayerEnabled";
+    private static final String K_SHEAR_CENTER_ALT_M    = CFG_PREFIX + "shearCenterAltM";
+    private static final String K_SHEAR_THICKNESS_M     = CFG_PREFIX + "shearThicknessM";
+    private static final String K_SHEAR_DELTA_MEAN_MPS  = CFG_PREFIX + "shearDeltaMeanMps";
+    private static final String K_SHEAR_DELTA_SIGMA_MPS = CFG_PREFIX + "shearDeltaSigmaMps";
+
     // -------------------------------------------------------------------------
     // Defaults
     // -------------------------------------------------------------------------
@@ -108,6 +127,23 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
     private static final double D_WIND_TURB_SIGMA_MPS = 0.0;
 
     private static final int D_WORKER_THREADS = 1;
+
+    // Gust defaults
+    private static final boolean D_GUST_ENABLED = false;
+    private static final int D_GUST_COUNT = 0;
+    private static final double D_GUST_WINDOW_START_S = 0.0;
+    private static final double D_GUST_WINDOW_END_S = 15.0;
+    private static final double D_GUST_DURATION_MEAN_S = 1.0;
+    private static final double D_GUST_DURATION_SIGMA_S = 0.25;
+    private static final double D_GUST_PEAK_MEAN_MPS = 0.0;
+    private static final double D_GUST_PEAK_SIGMA_MPS = 0.0;
+
+    // Shear defaults
+    private static final boolean D_SHEAR_ENABLED = false;
+    private static final double D_SHEAR_CENTER_ALT_M = 300.0;
+    private static final double D_SHEAR_THICKNESS_M = 150.0;
+    private static final double D_SHEAR_DELTA_MEAN_MPS = 0.0;
+    private static final double D_SHEAR_DELTA_SIGMA_MPS = 0.0;
 
     // -------------------------------------------------------------------------
     // Config helpers (same pattern as AirbrakeExtension — read/write directly
@@ -248,6 +284,13 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
     private transient long batchSeed = Long.MIN_VALUE;
     private transient long effectiveSeedUsed = Long.MIN_VALUE;
 
+    // ---------------------------------------------------------------------
+    // Per-run gust/shear artifacts (NOT persisted)
+    // ---------------------------------------------------------------------
+
+    private transient GustShearMetrics lastGustShearMetrics = null;
+    private transient RunWindDisturbanceProfile lastWindDisturbanceProfile = null;
+
     /** Called by MonteCarloBatchRunner on cloned extensions only. */
     public void setBatchRunContext(boolean v) { this.batchRunContext = v; }
 
@@ -256,6 +299,12 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
 
     /** For logging / CSV. */
     public long getEffectiveSeedUsed() { return effectiveSeedUsed; }
+
+    /** Per-run gust/shear metrics captured by GustShearListener (null if disabled or failed). */
+    public GustShearMetrics getLastGustShearMetrics() { return lastGustShearMetrics; }
+
+    /** Per-run gust/shear profile sampled at initialize(...) (null if disabled or failed). */
+    public RunWindDisturbanceProfile getLastWindDisturbanceProfile() { return lastWindDisturbanceProfile; }
 
     // -------------------------------------------------------------------------
     // OpenRocket entry point
@@ -405,6 +454,37 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
             double variedPa = clamp(basePa + rng.nextGaussian() * (sigmaMbar * 100.0), 50_000.0, 120_000.0);
             opts.setLaunchPressure(variedPa);
         }
+
+        // -----------------------------------------------------------------
+        // Per-step wind disturbances (gusts + shear)
+        // -----------------------------------------------------------------
+
+        this.lastGustShearMetrics = null;
+        this.lastWindDisturbanceProfile = null;
+
+        if (isGustEventsEnabled() || isShearLayerEnabled()) {
+            try {
+                RunWindDisturbanceProfile profile = RunWindDisturbanceProfile.sampleFromConfig(this, rng);
+                GustShearMetrics metrics = new GustShearMetrics();
+                metrics.resetAccumulators();
+
+                WindSnapshot baseline = WindSnapshot.capture(conditions, opts);
+
+                this.lastWindDisturbanceProfile = profile;
+                this.lastGustShearMetrics = metrics;
+
+                GustShearListener listener = new GustShearListener(baseline, profile, metrics, debugEnabled);
+                addSimulationListener(conditions, listener);
+
+                if (debugEnabled) {
+                    log.debug("MC Gust/Shear: enabled, gusts={}, shearEnabled={}",
+                            profile.gusts.size(), profile.shear != null);
+                }
+            } catch (Throwable t) {
+                // Never fail the whole run due to this optional feature.
+                if (debugEnabled) log.warn("MC Gust/Shear: failed to attach listener", t);
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -429,6 +509,66 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
         } catch (Exception ignored) { }
 
         throw new SimulationException("Cannot resolve SimulationOptions from SimulationConditions in this OpenRocket version.");
+    }
+
+    // -------------------------------------------------------------------------
+    // Simulation listener wiring (reflection-safe)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Adds a simulation listener in a version-tolerant way.
+     *
+     * We prefer SimulationConditions.getSimulationListenerList().add(...)
+     * but fall back to other patterns used by forks/older builds.
+     */
+    private static void addSimulationListener(SimulationConditions conditions, Object listener) {
+        if (conditions == null || listener == null) return;
+
+        Object list = invokeObject(conditions, "getSimulationListenerList");
+        if (list != null && invokeBestEffortAdd(list, listener)) return;
+
+        // Some forks use a different accessor name
+        Object list2 = invokeObject(conditions, "getSimulationListeners");
+        if (list2 != null && invokeBestEffortAdd(list2, listener)) return;
+
+        // Last resort: direct add methods on conditions
+        invokeBestEffortCall(conditions, "addSimulationListener", listener);
+        invokeBestEffortCall(conditions, "addListener", listener);
+    }
+
+    private static boolean invokeBestEffortAdd(Object list, Object listener) {
+        if (list == null || listener == null) return false;
+        for (Method m : list.getClass().getMethods()) {
+            String name = m.getName();
+            if (!(name.equals("add") || name.equals("addListener") || name.equals("addSimulationListener"))) continue;
+            if (m.getParameterCount() != 1) continue;
+            Class<?> p = m.getParameterTypes()[0];
+            if (!p.isAssignableFrom(listener.getClass())) continue;
+            try {
+                m.invoke(list, listener);
+                return true;
+            } catch (Exception ignored) {
+                // keep trying
+            }
+        }
+        return false;
+    }
+
+    private static boolean invokeBestEffortCall(Object target, String methodName, Object arg) {
+        if (target == null || methodName == null || arg == null) return false;
+        for (Method m : target.getClass().getMethods()) {
+            if (!m.getName().equals(methodName)) continue;
+            if (m.getParameterCount() != 1) continue;
+            Class<?> p = m.getParameterTypes()[0];
+            if (!p.isAssignableFrom(arg.getClass())) continue;
+            try {
+                m.invoke(target, arg);
+                return true;
+            } catch (Exception ignored) {
+                // keep trying
+            }
+        }
+        return false;
     }
 
     // -------------------------------------------------------------------------
@@ -811,6 +951,127 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
 
     public void setPressureStdDevMbar(double v) {
         cfgPutDouble(K_PRES_SIGMA_MBAR, Math.max(0.0, finiteOrZero(v)));
+        fireChangeEvent();
+    }
+
+    // -------------------------------------------------------------------------
+    // Gust / Shear disturbance config
+    // -------------------------------------------------------------------------
+
+    public boolean isGustEventsEnabled() {
+        return cfgBool(K_GUST_ENABLED, D_GUST_ENABLED);
+    }
+
+    public void setGustEventsEnabled(boolean v) {
+        cfgPutBool(K_GUST_ENABLED, v);
+        fireChangeEvent();
+    }
+
+    public int getGustEventCount() {
+        return Math.max(0, cfgInt(K_GUST_COUNT, D_GUST_COUNT));
+    }
+
+    public void setGustEventCount(int v) {
+        cfgPutInt(K_GUST_COUNT, Math.max(0, Math.min(50, v)));
+        fireChangeEvent();
+    }
+
+    public double getGustWindowStartS() {
+        return Math.max(0.0, finiteOrZero(cfgDouble(K_GUST_WINDOW_START_S, D_GUST_WINDOW_START_S)));
+    }
+
+    public void setGustWindowStartS(double v) {
+        cfgPutDouble(K_GUST_WINDOW_START_S, Math.max(0.0, finiteOrZero(v)));
+        fireChangeEvent();
+    }
+
+    public double getGustWindowEndS() {
+        return Math.max(0.0, finiteOrZero(cfgDouble(K_GUST_WINDOW_END_S, D_GUST_WINDOW_END_S)));
+    }
+
+    public void setGustWindowEndS(double v) {
+        cfgPutDouble(K_GUST_WINDOW_END_S, Math.max(0.0, finiteOrZero(v)));
+        fireChangeEvent();
+    }
+
+    public double getGustDurationMeanS() {
+        return Math.max(0.05, finiteOrZero(cfgDouble(K_GUST_DURATION_MEAN_S, D_GUST_DURATION_MEAN_S)));
+    }
+
+    public void setGustDurationMeanS(double v) {
+        cfgPutDouble(K_GUST_DURATION_MEAN_S, Math.max(0.05, finiteOrZero(v)));
+        fireChangeEvent();
+    }
+
+    public double getGustDurationSigmaS() {
+        return Math.max(0.0, finiteOrZero(cfgDouble(K_GUST_DURATION_SIGMA_S, D_GUST_DURATION_SIGMA_S)));
+    }
+
+    public void setGustDurationSigmaS(double v) {
+        cfgPutDouble(K_GUST_DURATION_SIGMA_S, Math.max(0.0, finiteOrZero(v)));
+        fireChangeEvent();
+    }
+
+    public double getGustPeakDeltaMeanMps() {
+        return Math.max(0.0, finiteOrZero(cfgDouble(K_GUST_PEAK_MEAN_MPS, D_GUST_PEAK_MEAN_MPS)));
+    }
+
+    public void setGustPeakDeltaMeanMps(double v) {
+        cfgPutDouble(K_GUST_PEAK_MEAN_MPS, Math.max(0.0, finiteOrZero(v)));
+        fireChangeEvent();
+    }
+
+    public double getGustPeakDeltaSigmaMps() {
+        return Math.max(0.0, finiteOrZero(cfgDouble(K_GUST_PEAK_SIGMA_MPS, D_GUST_PEAK_SIGMA_MPS)));
+    }
+
+    public void setGustPeakDeltaSigmaMps(double v) {
+        cfgPutDouble(K_GUST_PEAK_SIGMA_MPS, Math.max(0.0, finiteOrZero(v)));
+        fireChangeEvent();
+    }
+
+    public boolean isShearLayerEnabled() {
+        return cfgBool(K_SHEAR_ENABLED, D_SHEAR_ENABLED);
+    }
+
+    public void setShearLayerEnabled(boolean v) {
+        cfgPutBool(K_SHEAR_ENABLED, v);
+        fireChangeEvent();
+    }
+
+    public double getShearCenterAltM() {
+        return finiteOrZero(cfgDouble(K_SHEAR_CENTER_ALT_M, D_SHEAR_CENTER_ALT_M));
+    }
+
+    public void setShearCenterAltM(double v) {
+        cfgPutDouble(K_SHEAR_CENTER_ALT_M, finiteOrZero(v));
+        fireChangeEvent();
+    }
+
+    public double getShearThicknessM() {
+        return Math.max(1.0, finiteOrZero(cfgDouble(K_SHEAR_THICKNESS_M, D_SHEAR_THICKNESS_M)));
+    }
+
+    public void setShearThicknessM(double v) {
+        cfgPutDouble(K_SHEAR_THICKNESS_M, Math.max(1.0, finiteOrZero(v)));
+        fireChangeEvent();
+    }
+
+    public double getShearDeltaMeanMps() {
+        return Math.max(0.0, finiteOrZero(cfgDouble(K_SHEAR_DELTA_MEAN_MPS, D_SHEAR_DELTA_MEAN_MPS)));
+    }
+
+    public void setShearDeltaMeanMps(double v) {
+        cfgPutDouble(K_SHEAR_DELTA_MEAN_MPS, Math.max(0.0, finiteOrZero(v)));
+        fireChangeEvent();
+    }
+
+    public double getShearDeltaSigmaMps() {
+        return Math.max(0.0, finiteOrZero(cfgDouble(K_SHEAR_DELTA_SIGMA_MPS, D_SHEAR_DELTA_SIGMA_MPS)));
+    }
+
+    public void setShearDeltaSigmaMps(double v) {
+        cfgPutDouble(K_SHEAR_DELTA_SIGMA_MPS, Math.max(0.0, finiteOrZero(v)));
         fireChangeEvent();
     }
 

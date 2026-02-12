@@ -29,6 +29,37 @@ public class MonteCarloRunRecord {
     public final double windSpeedAverageSigma_mps;
     public final double windSpeedTurbulenceSigma_mps;
 
+    // ---------------------------------------------------------------------
+    // Gust / Shear configuration (what the extension was asked to do)
+    // ---------------------------------------------------------------------
+
+    public final boolean gustEventsEnabled;
+    public final boolean shearLayerEnabled;
+
+    public final int gustEventCountConfigured;
+    public final double gustWindowStart_s;
+    public final double gustWindowEnd_s;
+    public final double gustDurationMean_s;
+    public final double gustDurationSigma_s;
+    public final double gustPeakDeltaMean_mps;
+    public final double gustPeakDeltaSigma_mps;
+
+    public final double shearCenterAlt_m;
+    public final double shearThickness_m;
+    public final double shearDeltaMean_mps;
+    public final double shearDeltaSigma_mps;
+
+    // ---------------------------------------------------------------------
+    // Gust / Shear metrics (what actually happened during the run)
+    // ---------------------------------------------------------------------
+
+    public final int gustEventCountRealized;
+    public final double gustMaxDeltaWind_mps;
+    public final double shearDeltaApplied_mps;
+    public final double deltaWindImpulse_mps_s;
+    public final double maxTilt_deg;
+    public final double maxAoA_deg;
+
     public final String windModelType;
     public final List<WindLevel> windLevels = new ArrayList<>();
 
@@ -90,6 +121,27 @@ public class MonteCarloRunRecord {
             long seedUsed,
             double windSpeedAverageSigma_mps,
             double windSpeedTurbulenceSigma_mps,
+
+            boolean gustEventsEnabled,
+            boolean shearLayerEnabled,
+            int gustEventCountConfigured,
+            double gustWindowStart_s,
+            double gustWindowEnd_s,
+            double gustDurationMean_s,
+            double gustDurationSigma_s,
+            double gustPeakDeltaMean_mps,
+            double gustPeakDeltaSigma_mps,
+            double shearCenterAlt_m,
+            double shearThickness_m,
+            double shearDeltaMean_mps,
+            double shearDeltaSigma_mps,
+
+            int gustEventCountRealized,
+            double gustMaxDeltaWind_mps,
+            double shearDeltaApplied_mps,
+            double deltaWindImpulse_mps_s,
+            double maxTilt_deg,
+            double maxAoA_deg,
             SimulationOptions opts,
             SimulationData data
     ) {
@@ -101,6 +153,29 @@ public class MonteCarloRunRecord {
 
         this.windSpeedAverageSigma_mps = windSpeedAverageSigma_mps;
         this.windSpeedTurbulenceSigma_mps = windSpeedTurbulenceSigma_mps;
+
+        // Gust/shear config
+        this.gustEventsEnabled = gustEventsEnabled;
+        this.shearLayerEnabled = shearLayerEnabled;
+        this.gustEventCountConfigured = gustEventCountConfigured;
+        this.gustWindowStart_s = gustWindowStart_s;
+        this.gustWindowEnd_s = gustWindowEnd_s;
+        this.gustDurationMean_s = gustDurationMean_s;
+        this.gustDurationSigma_s = gustDurationSigma_s;
+        this.gustPeakDeltaMean_mps = gustPeakDeltaMean_mps;
+        this.gustPeakDeltaSigma_mps = gustPeakDeltaSigma_mps;
+        this.shearCenterAlt_m = shearCenterAlt_m;
+        this.shearThickness_m = shearThickness_m;
+        this.shearDeltaMean_mps = shearDeltaMean_mps;
+        this.shearDeltaSigma_mps = shearDeltaSigma_mps;
+
+        // Gust/shear metrics
+        this.gustEventCountRealized = gustEventCountRealized;
+        this.gustMaxDeltaWind_mps = gustMaxDeltaWind_mps;
+        this.shearDeltaApplied_mps = shearDeltaApplied_mps;
+        this.deltaWindImpulse_mps_s = deltaWindImpulse_mps_s;
+        this.maxTilt_deg = maxTilt_deg;
+        this.maxAoA_deg = maxAoA_deg;
 
         // Aliases for CSV exporter compatibility
         this.windSpeedAverageSigmaMps = windSpeedAverageSigma_mps;

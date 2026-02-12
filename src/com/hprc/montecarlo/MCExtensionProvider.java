@@ -7,6 +7,6 @@ import info.openrocket.core.simulation.extension.AbstractSimulationExtensionProv
 public class MCExtensionProvider extends AbstractSimulationExtensionProvider {
 
     public MCExtensionProvider() {
-        super(MonteCarloExtension.class, "NCSU HPRC", "Monte Carlo Wrapper");
+        super(MonteCarloExtension.class, "NCSU HPRC", "Monte Carlo Wrapper Dev");
     }
 }

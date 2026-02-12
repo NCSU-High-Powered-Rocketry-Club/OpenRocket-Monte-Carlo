@@ -142,6 +142,16 @@ public final class MonteCarloCsvExporter {
               .append("wind_speed_avg_sigma_mps,wind_speed_avg_sigma_mph,")
               .append("wind_speed_turb_sigma_mps,wind_speed_turb_sigma_mph,");
 
+        header.append("gust_enabled,shear_enabled,")
+              .append("gust_count_cfg,gust_window_start_s,gust_window_end_s,")
+              .append("gust_dur_mean_s,gust_dur_sigma_s,")
+              .append("gust_peak_mean_mps,gust_peak_sigma_mps,")
+              .append("shear_center_alt_m,shear_thickness_m,")
+              .append("shear_delta_mean_mps,shear_delta_sigma_mps,")
+              .append("gust_count_real,max_delta_wind_mps,max_delta_wind_mph,")
+              .append("shear_delta_mps,shear_delta_mph,")
+              .append("delta_wind_impulse_mps_s,max_tilt_deg,max_aoa_deg,");
+
         for (int i = 0; i < maxWindLevels; i++) {
             int n = i + 1;
             header.append("wind_level_").append(n).append("_alt_m,")
@@ -185,6 +195,29 @@ public final class MonteCarloCsvExporter {
            .append(UNIT_VELOCITY_MPH.toUnit(r.windSpeedAverageSigmaMps)).append(",")
            .append(r.windSpeedTurbulenceSigmaMps).append(",")
            .append(UNIT_VELOCITY_MPH.toUnit(r.windSpeedTurbulenceSigmaMps)).append(",");
+
+        // Gust/shear config + metrics
+        row.append(r.gustEventsEnabled).append(",")
+           .append(r.shearLayerEnabled).append(",")
+           .append(r.gustEventCountConfigured).append(",")
+           .append(r.gustWindowStart_s).append(",")
+           .append(r.gustWindowEnd_s).append(",")
+           .append(r.gustDurationMean_s).append(",")
+           .append(r.gustDurationSigma_s).append(",")
+           .append(r.gustPeakDeltaMean_mps).append(",")
+           .append(r.gustPeakDeltaSigma_mps).append(",")
+           .append(r.shearCenterAlt_m).append(",")
+           .append(r.shearThickness_m).append(",")
+           .append(r.shearDeltaMean_mps).append(",")
+           .append(r.shearDeltaSigma_mps).append(",")
+           .append(r.gustEventCountRealized).append(",")
+           .append(r.gustMaxDeltaWind_mps).append(",")
+           .append(UNIT_VELOCITY_MPH.toUnit(r.gustMaxDeltaWind_mps)).append(",")
+           .append(r.shearDeltaApplied_mps).append(",")
+           .append(UNIT_VELOCITY_MPH.toUnit(r.shearDeltaApplied_mps)).append(",")
+           .append(r.deltaWindImpulse_mps_s).append(",")
+           .append(r.maxTilt_deg).append(",")
+           .append(r.maxAoA_deg).append(",");
 
         for (int i = 0; i < maxWindLevels; i++) {
             if (i < r.windLevels.size()) {

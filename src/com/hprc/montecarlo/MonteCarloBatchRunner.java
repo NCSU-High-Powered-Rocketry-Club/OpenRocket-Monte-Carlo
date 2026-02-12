@@ -140,12 +140,43 @@ public final class MonteCarloBatchRunner {
                             double wSpeedSigma = 0.0;
                             double wTurbSigma = 0.0;
 
+                            // Gust/Shear config (captured for CSV)
+                            boolean gustEnabled = false;
+                            boolean shearEnabled = false;
+                            int gustCountCfg = 0;
+                            double gustWindowStartS = 0.0;
+                            double gustWindowEndS = 0.0;
+                            double gustDurMeanS = 0.0;
+                            double gustDurSigmaS = 0.0;
+                            double gustPeakMeanMps = 0.0;
+                            double gustPeakSigmaMps = 0.0;
+
+                            double shearCenterAltM = 0.0;
+                            double shearThicknessM = 0.0;
+                            double shearDeltaMeanMps = 0.0;
+                            double shearDeltaSigmaMps = 0.0;
+
                             if (mc != null) {
                                 mc.setBatchRunContext(true);
 
                                 det = mc.isUseDeterministicSeed();
                                 wSpeedSigma = mc.getWindSpeedAverageSigmaMps();
                                 wTurbSigma = mc.getWindSpeedTurbulenceSigmaMps();
+
+                                gustEnabled = mc.isGustEventsEnabled();
+                                shearEnabled = mc.isShearLayerEnabled();
+                                gustCountCfg = mc.getGustEventCount();
+                                gustWindowStartS = mc.getGustWindowStartS();
+                                gustWindowEndS = mc.getGustWindowEndS();
+                                gustDurMeanS = mc.getGustDurationMeanS();
+                                gustDurSigmaS = mc.getGustDurationSigmaS();
+                                gustPeakMeanMps = mc.getGustPeakDeltaMeanMps();
+                                gustPeakSigmaMps = mc.getGustPeakDeltaSigmaMps();
+
+                                shearCenterAltM = mc.getShearCenterAltM();
+                                shearThicknessM = mc.getShearThicknessM();
+                                shearDeltaMeanMps = mc.getShearDeltaMeanMps();
+                                shearDeltaSigmaMps = mc.getShearDeltaSigmaMps();
 
                                 if (det) {
                                     // Deterministic: baseSeed + (runIndex-1)
@@ -167,9 +198,45 @@ public final class MonteCarloBatchRunner {
                             SimulationData data = SimulationData.fromSimulation(sim, 0);
                             SimulationOptions opts = sim.getOptions();
 
+                            // Pull per-run gust/shear metrics from extension (if available)
+                            int gustCountReal = 0;
+                            double gustMaxDeltaWindMps = Double.NaN;
+                            double shearDeltaMps = Double.NaN;
+                            double deltaWindImpulse = Double.NaN;
+                            double maxTiltDeg = Double.NaN;
+                            double maxAoADeg = Double.NaN;
+
+                            if (mc != null) {
+                                GustShearMetrics m = mc.getLastGustShearMetrics();
+                                RunWindDisturbanceProfile p = mc.getLastWindDisturbanceProfile();
+                                if (m != null) {
+                                    gustCountReal = m.gustCount;
+                                    gustMaxDeltaWindMps = m.maxDeltaWind_mps;
+                                    shearDeltaMps = m.shearDelta_mps;
+                                    deltaWindImpulse = m.deltaWindImpulse_mps_s;
+                                    maxTiltDeg = m.maxTilt_deg;
+                                    maxAoADeg = m.maxAoA_deg;
+                                } else if (p != null) {
+                                    // Fallback: at least capture how many gusts were sampled.
+                                    gustCountReal = (p.gusts != null) ? p.gusts.size() : 0;
+                                }
+                            }
+
                             MonteCarloRunRecord rec = new MonteCarloRunRecord(
                                     runIndex, sim.getName(), det, seedUsed,
-                                    wSpeedSigma, wTurbSigma, opts, data
+                                    wSpeedSigma, wTurbSigma,
+
+                                    gustEnabled, shearEnabled,
+                                    gustCountCfg, gustWindowStartS, gustWindowEndS,
+                                    gustDurMeanS, gustDurSigmaS,
+                                    gustPeakMeanMps, gustPeakSigmaMps,
+                                    shearCenterAltM, shearThicknessM,
+                                    shearDeltaMeanMps, shearDeltaSigmaMps,
+
+                                    gustCountReal, gustMaxDeltaWindMps, shearDeltaMps,
+                                    deltaWindImpulse, maxTiltDeg, maxAoADeg,
+
+                                    opts, data
                             );
                             rec.setLandingEastM(data.landingEast_m);
                             rec.setLandingNorthM(data.landingNorth_m);

@@ -133,6 +133,47 @@ public class MonteCarloConfigurator
 
         panel.add(new JSeparator(), "span 3, growx");
 
+        // --------------------------------------------------------------
+        // Gusts / Shear (per-step wind disturbances)
+        // --------------------------------------------------------------
+
+        panel.add(sectionLabel("Wind disturbances (Gusts / Shear)"), "span 3, growx");
+
+        panel.add(new JLabel("Enable gust events"), "align label");
+        JCheckBox gustEnabled = new JCheckBox("", ext.isGustEventsEnabled());
+        gustEnabled.addActionListener(e -> ext.setGustEventsEnabled(gustEnabled.isSelected()));
+        panel.add(gustEnabled, "span 2, wrap");
+
+        panel.add(new JLabel("Gust event count"), "align label");
+        JSpinner gustCount = new JSpinner(new SpinnerNumberModel(
+                (Number) Integer.valueOf(ext.getGustEventCount()),
+                (Comparable<Integer>) Integer.valueOf(0),
+                (Comparable<Integer>) Integer.valueOf(50),
+                (Number) Integer.valueOf(1)));
+        gustCount.setEditor(new SpinnerEditor(gustCount));
+        gustCount.addChangeListener(e -> ext.setGustEventCount(((Number) gustCount.getValue()).intValue()));
+        panel.add(gustCount, "growx");
+        panel.add(new JLabel("events"));
+
+        addTimeSeconds(panel, "Gust window start", ext.getGustWindowStartS(), ext::setGustWindowStartS);
+        addTimeSeconds(panel, "Gust window end", ext.getGustWindowEndS(), ext::setGustWindowEndS);
+
+        addTimeSeconds(panel, "Gust duration mean", ext.getGustDurationMeanS(), ext::setGustDurationMeanS);
+        addTimeSeconds(panel, "Gust duration σ", ext.getGustDurationSigmaS(), ext::setGustDurationSigmaS);
+
+        addVelocityStdDev(panel, "Gust peak ΔV mean", ext, "GustPeakDeltaMeanMps");
+        addVelocityStdDev(panel, "Gust peak ΔV σ", ext, "GustPeakDeltaSigmaMps");
+
+        panel.add(new JLabel("Enable shear layer"), "align label");
+        JCheckBox shearEnabled = new JCheckBox("", ext.isShearLayerEnabled());
+        shearEnabled.addActionListener(e -> ext.setShearLayerEnabled(shearEnabled.isSelected()));
+        panel.add(shearEnabled, "span 2, wrap");
+
+        addLengthStdDev(panel, "Shear center altitude", ext, "ShearCenterAltM");
+        addLengthStdDev(panel, "Shear thickness", ext, "ShearThicknessM");
+        addVelocityStdDev(panel, "Shear ΔV mean", ext, "ShearDeltaMeanMps");
+        addVelocityStdDev(panel, "Shear ΔV σ", ext, "ShearDeltaSigmaMps");
+
         panel.add(new JSeparator(), "span 3, growx");
         panel.add(sectionLabel("Batch run / Export"), "span 3, growx");
 
@@ -394,6 +435,20 @@ public class MonteCarloConfigurator
 
         panel.add(spinner, "growx");
         panel.add(new JLabel("mbar"));
+    }
+
+    /** Simple seconds spinner with a fixed unit label.
+     *  We avoid UnitGroup.UNITS_TIME because it is not present in all OR builds.
+     */
+    private static void addTimeSeconds(JPanel panel, String label, double initialSeconds, DoubleConsumer setter) {
+        panel.add(new JLabel(label), "align label");
+
+        JSpinner spinner = new JSpinner(new SpinnerNumberModel(initialSeconds, 0.0, 10_000.0, 0.05));
+        spinner.setEditor(new SpinnerEditor(spinner));
+        spinner.addChangeListener(e -> setter.accept(((Number) spinner.getValue()).doubleValue()));
+
+        panel.add(spinner, "growx");
+        panel.add(new JLabel("s"));
     }
 
 
