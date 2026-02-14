@@ -77,13 +77,13 @@ public class MonteCarloConfigurator
 
         panel.add(sectionLabel("Launch / Orientation variation"), "span 3, growx");
 
-        addAngleStdDev(panel, "Launch rail angle σ", ext, "LaunchRodAngleStdDevDeg");
-        addAngleStdDev(panel, "Launch rail direction σ", ext, "LaunchRodDirectionStdDevDeg");
+        addAngleStdDev(panel, "Launch rail angle Ïƒ", ext, "LaunchRodAngleStdDevDeg");
+        addAngleStdDev(panel, "Launch rail direction Ïƒ", ext, "LaunchRodDirectionStdDevDeg");
 
-        addLengthStdDev(panel, "Launch altitude σ", ext, "LaunchAltitudeStdDevM");
+        addLengthStdDev(panel, "Launch altitude Ïƒ", ext, "LaunchAltitudeStdDevM");
 
-        addAngleStdDev(panel, "Launch latitude σ", ext, "LaunchLatitudeStdDevDeg");
-        addAngleStdDev(panel, "Launch longitude σ", ext, "LaunchLongitudeStdDevDeg");
+        addAngleStdDev(panel, "Launch latitude Ïƒ", ext, "LaunchLatitudeStdDevDeg");
+        addAngleStdDev(panel, "Launch longitude Ïƒ", ext, "LaunchLongitudeStdDevDeg");
 
         panel.add(new JSeparator(), "span 3, growx");
 
@@ -94,8 +94,8 @@ public class MonteCarloConfigurator
         // and only use the turbulence (gust std-dev) sigma.
         final boolean multiLevelSelected = isMultiLevelWindSelected(sim.getOptions());
 
-        // Wind speed average σ (disabled when Multi-level wind is selected)
-        JLabel windAvgSigmaLabel = new JLabel("Wind speed average σ");
+        // Wind speed average Ïƒ (disabled when Multi-level wind is selected)
+        JLabel windAvgSigmaLabel = new JLabel("Wind speed average Ïƒ");
         windAvgSigmaLabel.setEnabled(!multiLevelSelected);
         panel.add(windAvgSigmaLabel, "align label");
 
@@ -120,15 +120,15 @@ public class MonteCarloConfigurator
         panel.add(windAvgSigmaSpinner, "growx");
         panel.add(windAvgSigmaUnits);
 
-        // Wind speed turbulence σ (gust std-dev) — always enabled
-        addVelocityStdDev(panel, "Wind speed turbulence σ", ext, "WindSpeedTurbulenceSigmaMps");
+        // Wind speed turbulence Ïƒ (gust std-dev) â€” always enabled
+        addVelocityStdDev(panel, "Wind speed turbulence Ïƒ", ext, "WindSpeedTurbulenceSigmaMps");
 
-        addAngleStdDev(panel, "Wind direction σ", ext, "WindDirectionStdDevDeg");
+        addAngleStdDev(panel, "Wind direction Ïƒ", ext, "WindDirectionStdDevDeg");
 
-        addTemperatureStdDev(panel, "Temperature σ",
+        addTemperatureStdDev(panel, "Temperature Ïƒ",
                 ext.getTemperatureStdDevC(), ext::setTemperatureStdDevC);
 
-        addPressureStdDev(panel, "Pressure σ",
+        addPressureStdDev(panel, "Pressure Ïƒ",
                 ext.getPressureStdDevMbar(), ext::setPressureStdDevMbar);
 
         panel.add(new JSeparator(), "span 3, growx");
@@ -159,10 +159,10 @@ public class MonteCarloConfigurator
         addTimeSeconds(panel, "Gust window end", ext.getGustWindowEndS(), ext::setGustWindowEndS);
 
         addTimeSeconds(panel, "Gust duration mean", ext.getGustDurationMeanS(), ext::setGustDurationMeanS);
-        addTimeSeconds(panel, "Gust duration σ", ext.getGustDurationSigmaS(), ext::setGustDurationSigmaS);
+        addTimeSeconds(panel, "Gust duration Ïƒ", ext.getGustDurationSigmaS(), ext::setGustDurationSigmaS);
 
-        addVelocityStdDev(panel, "Gust peak ΔV mean", ext, "GustPeakDeltaMeanMps");
-        addVelocityStdDev(panel, "Gust peak ΔV σ", ext, "GustPeakDeltaSigmaMps");
+        addVelocityStdDev(panel, "Gust peak Î”V mean", ext, "GustPeakDeltaMeanMps");
+        addVelocityStdDev(panel, "Gust peak Î”V Ïƒ", ext, "GustPeakDeltaSigmaMps");
 
         panel.add(new JLabel("Enable shear layer"), "align label");
         JCheckBox shearEnabled = new JCheckBox("", ext.isShearLayerEnabled());
@@ -171,8 +171,34 @@ public class MonteCarloConfigurator
 
         addLengthStdDev(panel, "Shear center altitude", ext, "ShearCenterAltM");
         addLengthStdDev(panel, "Shear thickness", ext, "ShearThicknessM");
-        addVelocityStdDev(panel, "Shear ΔV mean", ext, "ShearDeltaMeanMps");
-        addVelocityStdDev(panel, "Shear ΔV σ", ext, "ShearDeltaSigmaMps");
+        addVelocityStdDev(panel, "Shear Î”V mean", ext, "ShearDeltaMeanMps");
+        addVelocityStdDev(panel, "Shear Î”V Ïƒ", ext, "ShearDeltaSigmaMps");
+
+        panel.add(new JSeparator(), "span 3, growx");
+
+        // --------------------------------------------------------------
+        // Vehicle / Motor physics overrides
+        // --------------------------------------------------------------
+
+        panel.add(sectionLabel("Vehicle / Motor variation"), "span 3, growx");
+
+        addPercentSigma(panel, "CD multiplier \u03c3",
+                ext.getCdMultiplierSigma() * 100.0,
+                v -> ext.setCdMultiplierSigma(v / 100.0),
+                "Drag coefficient variation (e.g. 5 = \u00b15% at 1\u03c3). " +
+                "Accounts for surface roughness, paint, fin alignment, launch lugs.");
+
+        addPercentSigma(panel, "Thrust multiplier \u03c3",
+                ext.getThrustMultiplierSigma() * 100.0,
+                v -> ext.setThrustMultiplierSigma(v / 100.0),
+                "Motor total impulse variation (e.g. 3 = \u00b13% at 1\u03c3). " +
+                "Typical motor-to-motor variation is 2\u20135%.");
+
+        addPercentSigma(panel, "Mass multiplier \u03c3",
+                ext.getMassMultiplierSigma() * 100.0,
+                v -> ext.setMassMultiplierSigma(v / 100.0),
+                "Rocket mass variation (e.g. 2 = \u00b12% at 1\u03c3). " +
+                "Accounts for epoxy, paint, and hardware tolerances.");
 
         panel.add(new JSeparator(), "span 3, growx");
         panel.add(sectionLabel("Batch run / Export"), "span 3, growx");
@@ -416,19 +442,19 @@ public class MonteCarloConfigurator
     private static void addTemperatureStdDev(JPanel panel, String label, double initialC, DoubleConsumer setter) {
         panel.add(new JLabel(label), "align label");
 
-        // σ as a delta in °C (Δ°C == ΔK)
+        // Ïƒ as a delta in Â°C (Î”Â°C == Î”K)
         JSpinner spinner = new JSpinner(new SpinnerNumberModel(initialC, 0.0, 500.0, 0.1));
         spinner.setEditor(new SpinnerEditor(spinner));
         spinner.addChangeListener(e -> setter.accept(((Number) spinner.getValue()).doubleValue()));
 
         panel.add(spinner, "growx");
-        panel.add(new JLabel("°C"));
+        panel.add(new JLabel("Â°C"));
     }
 
     private static void addPressureStdDev(JPanel panel, String label, double initialMbar, DoubleConsumer setter) {
         panel.add(new JLabel(label), "align label");
 
-        // σ as a delta in mbar
+        // Ïƒ as a delta in mbar
         JSpinner spinner = new JSpinner(new SpinnerNumberModel(initialMbar, 0.0, 20000.0, 1.0));
         spinner.setEditor(new SpinnerEditor(spinner));
         spinner.addChangeListener(e -> setter.accept(((Number) spinner.getValue()).doubleValue()));
@@ -449,6 +475,24 @@ public class MonteCarloConfigurator
 
         panel.add(spinner, "growx");
         panel.add(new JLabel("s"));
+    }
+
+    /**
+     * Percentage sigma spinner (e.g. "5" meaning 5%).
+     * The value is displayed/edited in percent; the setter receives percent too.
+     */
+    private static void addPercentSigma(JPanel panel, String label, double initialPercent, DoubleConsumer setter, String tooltip) {
+        JLabel lbl = new JLabel(label);
+        if (tooltip != null) lbl.setToolTipText(tooltip);
+        panel.add(lbl, "align label");
+
+        JSpinner spinner = new JSpinner(new SpinnerNumberModel(initialPercent, 0.0, 100.0, 0.5));
+        spinner.setEditor(new SpinnerEditor(spinner));
+        spinner.addChangeListener(e -> setter.accept(((Number) spinner.getValue()).doubleValue()));
+        if (tooltip != null) spinner.setToolTipText(tooltip);
+
+        panel.add(spinner, "growx");
+        panel.add(new JLabel("%"));
     }
 
 

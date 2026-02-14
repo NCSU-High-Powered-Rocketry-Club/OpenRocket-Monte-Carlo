@@ -60,6 +60,24 @@ public class MonteCarloRunRecord {
     public final double maxTilt_deg;
     public final double maxAoA_deg;
 
+    // ---------------------------------------------------------------------
+    // Vehicle / Motor physics overrides (config + realized)
+    // ---------------------------------------------------------------------
+
+    /** Configured CD multiplier sigma (0 = disabled) */
+    public final double cdMultiplierSigma;
+    /** Configured thrust multiplier sigma (0 = disabled) */
+    public final double thrustMultiplierSigma;
+    /** Configured mass multiplier sigma (0 = disabled) */
+    public final double massMultiplierSigma;
+
+    /** Actual CD multiplier used for this run (1.0 if disabled) */
+    public final double cdMultiplierUsed;
+    /** Actual thrust multiplier used for this run (1.0 if disabled) */
+    public final double thrustMultiplierUsed;
+    /** Actual mass multiplier used for this run (1.0 if disabled) */
+    public final double massMultiplierUsed;
+
     public final String windModelType;
     public final List<WindLevel> windLevels = new ArrayList<>();
 
@@ -142,6 +160,14 @@ public class MonteCarloRunRecord {
             double deltaWindImpulse_mps_s,
             double maxTilt_deg,
             double maxAoA_deg,
+
+            double cdMultiplierSigma,
+            double thrustMultiplierSigma,
+            double massMultiplierSigma,
+            double cdMultiplierUsed,
+            double thrustMultiplierUsed,
+            double massMultiplierUsed,
+
             SimulationOptions opts,
             SimulationData data
     ) {
@@ -176,6 +202,14 @@ public class MonteCarloRunRecord {
         this.deltaWindImpulse_mps_s = deltaWindImpulse_mps_s;
         this.maxTilt_deg = maxTilt_deg;
         this.maxAoA_deg = maxAoA_deg;
+
+        // Physics overrides
+        this.cdMultiplierSigma = cdMultiplierSigma;
+        this.thrustMultiplierSigma = thrustMultiplierSigma;
+        this.massMultiplierSigma = massMultiplierSigma;
+        this.cdMultiplierUsed = cdMultiplierUsed;
+        this.thrustMultiplierUsed = thrustMultiplierUsed;
+        this.massMultiplierUsed = massMultiplierUsed;
 
         // Aliases for CSV exporter compatibility
         this.windSpeedAverageSigmaMps = windSpeedAverageSigma_mps;

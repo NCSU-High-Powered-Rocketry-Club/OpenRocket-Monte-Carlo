@@ -28,14 +28,16 @@ final class WindSnapshot {
     final boolean multiLevelActive;
 
     private final ScalarSnapshot scalar;
-    private final List<MLModelSnapshot> mlModels;
+
+    /** Snapshots for the active multi-level wind model(s), if we can access them. */
+    private final List<ModelSnapshot> mlModels;
 
     private WindSnapshot(SimulationConditions conditions,
                          SimulationOptions options,
                          Object windModel,
                          boolean multiLevelActive,
                          ScalarSnapshot scalar,
-                         List<MLModelSnapshot> mlModels) {
+                         List<ModelSnapshot> mlModels) {
         this.conditions = conditions;
         this.options = options;
         this.windModel = windModel;
@@ -49,41 +51,21 @@ final class WindSnapshot {
         boolean multi = isMultiLevelActive(conditions, opts, wm);
 
         // Multi-level snapshots (potentially multiple distinct objects)
-        List<MLModelSnapshot> mlSnaps = new ArrayList<>();
+        List<ModelSnapshot> mlSnaps = new ArrayList<>();
         if (multi) {
-            Map<MultiLevelPinkNoiseWindModel, Boolean> seen = new IdentityHashMap<>();
+            Map<Object, Boolean> seen = new IdentityHashMap<>();
 
-            if (wm instanceof MultiLevelPinkNoiseWindModel ml && !seen.containsKey(ml)) {
-                seen.put(ml, Boolean.TRUE);
-                mlSnaps.add(new MLModelSnapshot(ml));
-            }
-
-            Object mlCondObj = invokeObject(conditions, "getMultiLevelWindModel");
-            if (mlCondObj instanceof MultiLevelPinkNoiseWindModel ml && !seen.containsKey(ml)) {
-                seen.put(ml, Boolean.TRUE);
-                mlSnaps.add(new MLModelSnapshot(ml));
-            }
-
-            MultiLevelPinkNoiseWindModel mlOpts = null;
-            if (opts != null) {
-                try {
-                    mlOpts = opts.getMultiLevelWindModel();
-                } catch (Throwable ignored) {
-                }
-            }
-            if (mlOpts != null && !seen.containsKey(mlOpts)) {
-                seen.put(mlOpts, Boolean.TRUE);
-                mlSnaps.add(new MLModelSnapshot(mlOpts));
-            }
+            addMultiLevelSnapshotIfPossible(mlSnaps, seen, wm);
+            addMultiLevelSnapshotIfPossible(mlSnaps, seen, invokeObject(conditions, "getMultiLevelWindModel"));
+            addMultiLevelSnapshotIfPossible(mlSnaps, seen, invokeObject(opts, "getMultiLevelWindModel"));
         }
 
-        ScalarSnapshot scalarSnap = null;
-        if (!multi) {
-            double baseSpeed = readScalarSpeed(conditions, opts, wm);
-            double baseDir = readScalarDirection(conditions, opts, wm);
-            double baseStd = readScalarStdDev(conditions, opts, wm);
-            scalarSnap = new ScalarSnapshot(baseSpeed, baseDir, baseStd);
-        }
+        // Always capture a scalar baseline if we can.  This gives us a fallback path for
+        // multi-level wind profiles we cannot introspect/mutate at the level list.
+        double baseSpeed = readScalarSpeed(conditions, opts, wm);
+        double baseDir = readScalarDirection(conditions, opts, wm);
+        double baseStd = readScalarStdDev(conditions, opts, wm);
+        ScalarSnapshot scalarSnap = new ScalarSnapshot(baseSpeed, baseDir, baseStd);
 
         return new WindSnapshot(conditions, opts, wm, multi, scalarSnap, mlSnaps);
     }
@@ -91,19 +73,23 @@ final class WindSnapshot {
     void applyDelta(RunWindDisturbanceProfile profile, double t_s, double rocketAlt_m) {
         if (profile == null) return;
 
-        if (multiLevelActive) {
-            for (MLModelSnapshot snap : mlModels) {
+        if (multiLevelActive && mlModels != null && !mlModels.isEmpty()) {
+            for (ModelSnapshot snap : mlModels) {
                 snap.apply(profile, t_s);
             }
-        } else if (scalar != null) {
+            return;
+        }
+
+        // Scalar (or multi-level fallback)
+        if (scalar != null) {
             Vec2 delta = profile.deltaWindXY(t_s, rocketAlt_m);
 
-            Vec2 base = Vec2.fromPolar(scalar.baseSpeed_mps, scalar.baseDir_rad);
+            Vec2 base = Vec2.fromOpenRocketWind(scalar.baseSpeed_mps, scalar.baseDir_rad);
             Vec2 total = base.add(delta);
-            Vec2.Polar p = Vec2.toPolar(total);
+            Vec2.OpenRocketWind p = Vec2.toOpenRocketWind(total);
 
             double speed = Math.max(0.0, p.speed);
-            double dir = p.dirRad;
+            double dir = p.windFromDirRad;
 
             setScalarWindSpeedEverywhere(conditions, options, windModel, speed);
             setScalarWindDirectionEverywhere(conditions, options, windModel, dir);
@@ -116,11 +102,14 @@ final class WindSnapshot {
     }
 
     void restore() {
-        if (multiLevelActive) {
-            for (MLModelSnapshot snap : mlModels) {
+        if (multiLevelActive && mlModels != null && !mlModels.isEmpty()) {
+            for (ModelSnapshot snap : mlModels) {
                 snap.restore();
             }
-        } else if (scalar != null) {
+            return;
+        }
+
+        if (scalar != null) {
             setScalarWindSpeedEverywhere(conditions, options, windModel, scalar.baseSpeed_mps);
             setScalarWindDirectionEverywhere(conditions, options, windModel, scalar.baseDir_rad);
             if (Double.isFinite(scalar.baseStdDev_mps)) {
@@ -133,7 +122,32 @@ final class WindSnapshot {
     // Multi-level snapshot
     // ---------------------------------------------------------------------
 
-    private static final class MLModelSnapshot {
+    private static void addMultiLevelSnapshotIfPossible(
+            List<ModelSnapshot> out,
+            Map<Object, Boolean> seen,
+            Object modelObj
+    ) {
+        if (out == null || seen == null || modelObj == null) return;
+        if (seen.containsKey(modelObj)) return;
+        seen.put(modelObj, Boolean.TRUE);
+
+        if (modelObj instanceof MultiLevelPinkNoiseWindModel ml) {
+            out.add(new MLModelSnapshot(ml));
+            return;
+        }
+
+        GenericMLModelSnapshot g = new GenericMLModelSnapshot(modelObj);
+        if (g.isUsable()) {
+            out.add(g);
+        }
+    }
+
+    private interface ModelSnapshot {
+        void apply(RunWindDisturbanceProfile profile, double t_s);
+        void restore();
+    }
+
+    private static final class MLModelSnapshot implements ModelSnapshot {
         final MultiLevelPinkNoiseWindModel model;
         final List<LevelBaseline> levels = new ArrayList<>();
 
@@ -146,19 +160,20 @@ final class WindSnapshot {
             }
         }
 
-        void apply(RunWindDisturbanceProfile profile, double t_s) {
+        @Override
+        public void apply(RunWindDisturbanceProfile profile, double t_s) {
             if (model == null || profile == null) return;
 
             for (LevelBaseline b : levels) {
                 double alt = b.altitude_m;
 
-                Vec2 base = Vec2.fromPolar(b.baseSpeed_mps, b.baseDir_rad);
+                Vec2 base = Vec2.fromOpenRocketWind(b.baseSpeed_mps, b.baseDir_rad);
                 Vec2 delta = profile.deltaWindXY(t_s, alt);
                 Vec2 total = base.add(delta);
-                Vec2.Polar p = Vec2.toPolar(total);
 
+                Vec2.OpenRocketWind p = Vec2.toOpenRocketWind(total);
                 double speed = Math.max(0.0, p.speed);
-                double dir = p.dirRad;
+                double dir = p.windFromDirRad;
 
                 b.level.setSpeed(speed);
                 b.level.setDirection(dir);
@@ -173,7 +188,8 @@ final class WindSnapshot {
             }
         }
 
-        void restore() {
+        @Override
+        public void restore() {
             if (model == null) return;
 
             for (LevelBaseline b : levels) {
@@ -213,6 +229,170 @@ final class WindSnapshot {
         }
     }
 
+    /**
+     * Generic multi-level wind model snapshot for imported profiles or other OR wind models.
+     *
+     * We look for a "getLevels"-like method on the wind model and "getAltitude/getSpeed/getDirection"
+     * plus "setSpeed/setDirection" on each level object.  If any of these are missing, we simply
+     * do not apply deltas for that model.
+     */
+    private static final class GenericMLModelSnapshot implements ModelSnapshot {
+        final Object model;
+        final List<GenericLevelBaseline> levels = new ArrayList<>();
+
+        GenericMLModelSnapshot(Object model) {
+            this.model = model;
+            if (model == null) return;
+
+            for (Object lvl : getLevelObjects(model)) {
+                GenericLevelBaseline b = GenericLevelBaseline.tryCreate(lvl);
+                if (b != null) levels.add(b);
+            }
+        }
+
+        boolean isUsable() {
+            return model != null && !levels.isEmpty();
+        }
+
+        @Override
+        public void apply(RunWindDisturbanceProfile profile, double t_s) {
+            if (profile == null || levels.isEmpty()) return;
+
+            for (GenericLevelBaseline b : levels) {
+                double alt = b.altitude_m;
+
+                Vec2 base = Vec2.fromOpenRocketWind(b.baseSpeed_mps, b.baseDir_rad);
+                Vec2 delta = profile.deltaWindXY(t_s, alt);
+                Vec2 total = base.add(delta);
+
+                Vec2.OpenRocketWind p = Vec2.toOpenRocketWind(total);
+                double speed = Math.max(0.0, p.speed);
+                double dir = p.windFromDirRad;
+
+                b.setSpeed(speed);
+                b.setDirection(dir);
+
+                if (Double.isFinite(b.baseStdDev_mps)) {
+                    b.setStdDev(Math.max(0.0, b.baseStdDev_mps));
+                }
+            }
+        }
+
+        @Override
+        public void restore() {
+            if (levels.isEmpty()) return;
+            for (GenericLevelBaseline b : levels) {
+                b.setSpeed(Math.max(0.0, b.baseSpeed_mps));
+                b.setDirection(b.baseDir_rad);
+                if (Double.isFinite(b.baseStdDev_mps)) {
+                    b.setStdDev(Math.max(0.0, b.baseStdDev_mps));
+                }
+            }
+        }
+
+        private static List<Object> getLevelObjects(Object model) {
+            if (model == null) return List.of();
+
+            Object v = null;
+            // common candidates
+            v = invokeObject(model, "getLevels");
+            if (v == null) v = invokeObject(model, "getWindLevels");
+            if (v == null) v = invokeObject(model, "getLevelModels");
+            if (v == null) v = invokeObject(model, "getWindLevelModels");
+
+            List<Object> out = new ArrayList<>();
+            if (v instanceof Iterable<?> it) {
+                for (Object o : it) if (o != null) out.add(o);
+            } else if (v != null && v.getClass().isArray()) {
+                int n = java.lang.reflect.Array.getLength(v);
+                for (int i = 0; i < n; i++) {
+                    Object o = java.lang.reflect.Array.get(v, i);
+                    if (o != null) out.add(o);
+                }
+            }
+            return out;
+        }
+
+        private static final class GenericLevelBaseline {
+            final Object level;
+            final double altitude_m;
+            final double baseSpeed_mps;
+            final double baseDir_rad;
+            final double baseStdDev_mps;
+
+            GenericLevelBaseline(Object level, double altitude_m, double baseSpeed_mps, double baseDir_rad, double baseStdDev_mps) {
+                this.level = level;
+                this.altitude_m = altitude_m;
+                this.baseSpeed_mps = baseSpeed_mps;
+                this.baseDir_rad = baseDir_rad;
+                this.baseStdDev_mps = baseStdDev_mps;
+            }
+
+            static GenericLevelBaseline tryCreate(Object lvl) {
+                if (lvl == null) return null;
+
+                // If we can't set speed/direction, this level isn't usable.
+                boolean canSetSpeed = hasSetter(lvl, "setSpeed") || hasSetter(lvl, "setWindSpeed");
+                boolean canSetDir = hasSetter(lvl, "setDirection") || hasSetter(lvl, "setWindDirection");
+                if (!canSetSpeed || !canSetDir) return null;
+
+                double alt = invokeDouble(lvl, "getAltitude", Double.NaN);
+                if (!Double.isFinite(alt)) alt = invokeDouble(lvl, "getAltitude_m", Double.NaN);
+                if (!Double.isFinite(alt)) alt = invokeDouble(lvl, "altitude", Double.NaN);
+                if (!Double.isFinite(alt)) alt = 0.0;
+
+                double spd = invokeDouble(lvl, "getSpeed", Double.NaN);
+                if (!Double.isFinite(spd)) spd = invokeDouble(lvl, "getWindSpeed", Double.NaN);
+                if (!Double.isFinite(spd)) spd = 0.0;
+
+                double dir = invokeDouble(lvl, "getDirection", Double.NaN);
+                if (!Double.isFinite(dir)) dir = invokeDouble(lvl, "getWindDirection", Double.NaN);
+                if (!Double.isFinite(dir)) dir = 0.0;
+
+                double std = invokeDouble(lvl, "getStandardDeviation", Double.NaN);
+                if (!Double.isFinite(std)) std = invokeDouble(lvl, "getWindStandardDeviation", Double.NaN);
+                if (!Double.isFinite(std)) std = Double.NaN;
+
+                return new GenericLevelBaseline(lvl, alt, spd, dir, std);
+            }
+
+            void setSpeed(double speedMps) {
+                if (!tryInvokeVoidDouble(level, "setSpeed", speedMps)) {
+                    tryInvokeVoidDouble(level, "setWindSpeed", speedMps);
+                }
+            }
+
+            void setDirection(double dirRad) {
+                if (!tryInvokeVoidDouble(level, "setDirection", dirRad)) {
+                    tryInvokeVoidDouble(level, "setWindDirection", dirRad);
+                }
+            }
+
+            void setStdDev(double stdMps) {
+                if (!tryInvokeVoidDouble(level, "setStandardDeviation", stdMps)) {
+                    if (!tryInvokeVoidDouble(level, "setWindStandardDeviation", stdMps)) {
+                        tryInvokeVoidDouble(level, "setStdDev", stdMps);
+                    }
+                }
+            }
+
+            private static boolean hasSetter(Object target, String methodName) {
+                if (target == null) return false;
+                try {
+                    target.getClass().getMethod(methodName, double.class);
+                    return true;
+                } catch (Exception ignored) {
+                    try {
+                        target.getClass().getMethod(methodName, Double.class);
+                        return true;
+                    } catch (Exception ignored2) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
     private static final class ScalarSnapshot {
         final double baseSpeed_mps;
         final double baseDir_rad;
@@ -237,6 +417,11 @@ final class WindSnapshot {
 
     private static boolean isMultiLevelActive(SimulationConditions conditions, SimulationOptions opts, Object windModel) {
         if (windModel instanceof MultiLevelPinkNoiseWindModel) return true;
+
+        // If a multi-level model object is present, treat as multi-level even if
+        // WindModelType's toString() doesn't include "multi".
+        if (invokeObject(conditions, "getMultiLevelWindModel") != null) return true;
+        if (invokeObject(opts, "getMultiLevelWindModel") != null) return true;
 
         Object t = invokeObject(conditions, "getWindModelType");
         if (t == null) t = invokeObject(opts, "getWindModelType");

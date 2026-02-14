@@ -9,6 +9,7 @@ import info.openrocket.core.simulation.SimulationOptions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.lang.reflect.Field;
 import java.util.List;
 
 /**
@@ -98,6 +99,20 @@ public final class SimulationData {
         List<Double> posX = branch.get(FlightDataType.TYPE_POSITION_X);
         List<Double> posY = branch.get(FlightDataType.TYPE_POSITION_Y);
 
+        // Optional: some OpenRocket builds expose explicit latitude/longitude time series.
+        // If present, prefer these for landing coordinates to avoid any ambiguity about the
+        // POSITION_X/Y reference frame.
+        List<Double> latSeries = tryGetSeries(branch,
+                "TYPE_LATITUDE",
+                "TYPE_POSITION_LATITUDE",
+                "TYPE_GPS_LATITUDE",
+                "TYPE_LAT");
+        List<Double> lonSeries = tryGetSeries(branch,
+                "TYPE_LONGITUDE",
+                "TYPE_POSITION_LONGITUDE",
+                "TYPE_GPS_LONGITUDE",
+                "TYPE_LON");
+
         List<Double> velocity = branch.get(FlightDataType.TYPE_VELOCITY_TOTAL);
         List<Double> accel = branch.get(FlightDataType.TYPE_ACCELERATION_TOTAL);
 
@@ -147,8 +162,21 @@ public final class SimulationData {
             out.landingDownrange_m = down;
             out.landingCrossrange_m = cross;
 
-            // 5b) Rotate and Compute Lat/Lon
-            computeLandingENU(out, down, cross);
+            // 5b) Compute landing location
+            if (hasLatLonAtIndex(latSeries, lonSeries, iLand)) {
+                out.landingLat_deg = latSeries.get(iLand);
+                out.landingLon_deg = lonSeries.get(iLand);
+                double[] enu = LandingDispersion6DOF.latLonToEnuM(
+                        out.landingLat_deg,
+                        out.landingLon_deg,
+                        out.launchLat_deg,
+                        out.launchLon_deg
+                );
+                out.landingEast_m = enu[0];
+                out.landingNorth_m = enu[1];
+            } else {
+                computeLandingENU(out, down, cross);
+            }
 
         } else {
             // No landing event found (sim stopped early or crashed).
@@ -163,7 +191,20 @@ public final class SimulationData {
             out.landingDownrange_m = down;
             out.landingCrossrange_m = cross;
 
-            computeLandingENU(out, down, cross);
+            if (hasLatLonAtIndex(latSeries, lonSeries, iLand)) {
+                out.landingLat_deg = latSeries.get(iLand);
+                out.landingLon_deg = lonSeries.get(iLand);
+                double[] enu = LandingDispersion6DOF.latLonToEnuM(
+                        out.landingLat_deg,
+                        out.landingLon_deg,
+                        out.launchLat_deg,
+                        out.launchLon_deg
+                );
+                out.landingEast_m = enu[0];
+                out.landingNorth_m = enu[1];
+            } else {
+                computeLandingENU(out, down, cross);
+            }
         }
 
         return out;
@@ -173,8 +214,12 @@ public final class SimulationData {
      * Helper to perform coordinate rotation and Lat/Lon conversion.
      */
     private static void computeLandingENU(SimulationData out, double posX, double posY) {
-        // OpenRocket 24.12: TYPE_POSITION_X = East, TYPE_POSITION_Y = North
-        // in the world ENU frame. No rotation needed.
+        // Fallback path when no explicit latitude/longitude series is available.
+        //
+        // Many OpenRocket builds expose POSITION_X/Y in the world ENU frame (x=East, y=North).
+        // Some historical builds have used alternate "downrange/crossrange" frames. If your
+        // landing map looks rotated/flipped, prefer extracting latitude/longitude directly
+        // (see tryGetSeries above) or verify POSITION_X/Y semantics for your OR version.
         out.landingEast_m  = posX;
         out.landingNorth_m = posY;
 
@@ -186,6 +231,36 @@ public final class SimulationData {
         );
         out.landingLat_deg = ll[0];
         out.landingLon_deg = ll[1];
+    }
+
+    private static boolean hasLatLonAtIndex(List<Double> latSeries, List<Double> lonSeries, int idx) {
+        if (latSeries == null || lonSeries == null) return false;
+        if (idx < 0 || idx >= latSeries.size() || idx >= lonSeries.size()) return false;
+        Double lat = latSeries.get(idx);
+        Double lon = lonSeries.get(idx);
+        if (lat == null || lon == null) return false;
+        if (!Double.isFinite(lat) || !Double.isFinite(lon)) return false;
+        if (Math.abs(lat) > 90.0 + 1e-6) return false;
+        if (Math.abs(lon) > 180.0 + 1e-6) return false;
+        return true;
+    }
+
+    @SafeVarargs
+    private static List<Double> tryGetSeries(FlightDataBranch branch, String... flightDataTypeFieldNames) {
+        if (branch == null || flightDataTypeFieldNames == null) return null;
+        for (String name : flightDataTypeFieldNames) {
+            if (name == null || name.isBlank()) continue;
+            try {
+                Field f = FlightDataType.class.getField(name);
+                Object o = f.get(null);
+                if (!(o instanceof FlightDataType t)) continue;
+                List<Double> s = branch.get(t);
+                if (s != null && !s.isEmpty()) return s;
+            } catch (Throwable ignored) {
+                // Field may not exist in this OR build or branch may not contain it.
+            }
+        }
+        return null;
     }
 
     // ---------------------------------------------------------------------------

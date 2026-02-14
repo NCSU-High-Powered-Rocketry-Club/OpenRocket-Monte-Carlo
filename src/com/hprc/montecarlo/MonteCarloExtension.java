@@ -101,6 +101,11 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
     private static final String K_SHEAR_DELTA_MEAN_MPS  = CFG_PREFIX + "shearDeltaMeanMps";
     private static final String K_SHEAR_DELTA_SIGMA_MPS = CFG_PREFIX + "shearDeltaSigmaMps";
 
+    // Vehicle / Motor physics override keys
+    private static final String K_CD_MULT_SIGMA      = CFG_PREFIX + "cdMultiplierSigma";
+    private static final String K_THRUST_MULT_SIGMA  = CFG_PREFIX + "thrustMultiplierSigma";
+    private static final String K_MASS_MULT_SIGMA    = CFG_PREFIX + "massMultiplierSigma";
+
     // -------------------------------------------------------------------------
     // Defaults
     // -------------------------------------------------------------------------
@@ -145,8 +150,13 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
     private static final double D_SHEAR_DELTA_MEAN_MPS = 0.0;
     private static final double D_SHEAR_DELTA_SIGMA_MPS = 0.0;
 
+    // Vehicle / Motor physics override defaults (multiplier sigma, 0 = disabled)
+    private static final double D_CD_MULT_SIGMA = 0.0;
+    private static final double D_THRUST_MULT_SIGMA = 0.0;
+    private static final double D_MASS_MULT_SIGMA = 0.0;
+
     // -------------------------------------------------------------------------
-    // Config helpers (same pattern as AirbrakeExtension — read/write directly
+    // Config helpers (same pattern as AirbrakeExtension â€” read/write directly
     // from the inherited `config` field, never cache)
     // -------------------------------------------------------------------------
 
@@ -291,6 +301,11 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
     private transient GustShearMetrics lastGustShearMetrics = null;
     private transient RunWindDisturbanceProfile lastWindDisturbanceProfile = null;
 
+    // Per-run physics override values (NOT persisted — set during initialize())
+    private transient double lastCdMultiplier = 1.0;
+    private transient double lastThrustMultiplier = 1.0;
+    private transient double lastMassMultiplier = 1.0;
+
     /** Called by MonteCarloBatchRunner on cloned extensions only. */
     public void setBatchRunContext(boolean v) { this.batchRunContext = v; }
 
@@ -305,6 +320,15 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
 
     /** Per-run gust/shear profile sampled at initialize(...) (null if disabled or failed). */
     public RunWindDisturbanceProfile getLastWindDisturbanceProfile() { return lastWindDisturbanceProfile; }
+
+    /** Per-run CD multiplier actually used (1.0 if disabled). */
+    public double getLastCdMultiplier() { return lastCdMultiplier; }
+
+    /** Per-run thrust multiplier actually used (1.0 if disabled). */
+    public double getLastThrustMultiplier() { return lastThrustMultiplier; }
+
+    /** Per-run mass multiplier actually used (1.0 if disabled). */
+    public double getLastMassMultiplier() { return lastMassMultiplier; }
 
     // -------------------------------------------------------------------------
     // OpenRocket entry point
@@ -483,6 +507,52 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
             } catch (Throwable t) {
                 // Never fail the whole run due to this optional feature.
                 if (debugEnabled) log.warn("MC Gust/Shear: failed to attach listener", t);
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Vehicle / Motor physics overrides (CD, thrust, mass multipliers)
+        // -----------------------------------------------------------------
+
+        this.lastCdMultiplier = 1.0;
+        this.lastThrustMultiplier = 1.0;
+        this.lastMassMultiplier = 1.0;
+
+        final double cdSigma = Math.max(0.0, finiteOrZero(getCdMultiplierSigma()));
+        final double thrustSigma = Math.max(0.0, finiteOrZero(getThrustMultiplierSigma()));
+        final double massSigma = Math.max(0.0, finiteOrZero(getMassMultiplierSigma()));
+
+        if (cdSigma > 0.0 || thrustSigma > 0.0 || massSigma > 0.0) {
+            // Sample multipliers: Gaussian centered at 1.0, clamped to safe bounds
+            double cdMult = 1.0;
+            double thrustMult = 1.0;
+            double massMult = 1.0;
+
+            if (cdSigma > 0.0) {
+                cdMult = clamp(1.0 + rng.nextGaussian() * cdSigma, 0.5, 2.0);
+            }
+            if (thrustSigma > 0.0) {
+                thrustMult = clamp(1.0 + rng.nextGaussian() * thrustSigma, 0.5, 1.5);
+            }
+            if (massSigma > 0.0) {
+                massMult = clamp(1.0 + rng.nextGaussian() * massSigma, 0.7, 1.5);
+            }
+
+            this.lastCdMultiplier = cdMult;
+            this.lastThrustMultiplier = thrustMult;
+            this.lastMassMultiplier = massMult;
+
+            try {
+                PhysicsOverrideListener physListener =
+                        new PhysicsOverrideListener(cdMult, thrustMult, massMult, debugEnabled);
+                addSimulationListener(conditions, physListener);
+
+                if (debugEnabled) {
+                    log.debug("MC Physics: cdMult={}, thrustMult={}, massMult={}",
+                            cdMult, thrustMult, massMult);
+                }
+            } catch (Throwable t) {
+                if (debugEnabled) log.warn("MC Physics: failed to attach listener", t);
             }
         }
     }
@@ -810,7 +880,7 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
 
     @Override
     public String getDescription() {
-        return "Monte Carlo variations for wind, launch rail, and atmosphere (configured in Simulation Extensions tab).";
+        return "Monte Carlo variations for wind, launch rail, atmosphere, and vehicle physics (CD, thrust, mass).";
     }
 
     // -------------------------------------------------------------------------
@@ -1075,6 +1145,47 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
         fireChangeEvent();
     }
 
+    // ---- Vehicle / Motor physics override ----
+
+    /**
+     * Standard deviation of the CD (drag coefficient) multiplier.
+     * 0 = disabled. 0.05 = ±5% variation at 1σ. Multiplier is N(1.0, sigma).
+     */
+    public double getCdMultiplierSigma() {
+        return Math.max(0.0, finiteOrZero(cfgDouble(K_CD_MULT_SIGMA, D_CD_MULT_SIGMA)));
+    }
+
+    public void setCdMultiplierSigma(double v) {
+        cfgPutDouble(K_CD_MULT_SIGMA, Math.max(0.0, finiteOrZero(v)));
+        fireChangeEvent();
+    }
+
+    /**
+     * Standard deviation of the thrust multiplier.
+     * 0 = disabled. 0.03 = ±3% variation at 1σ. Multiplier is N(1.0, sigma).
+     */
+    public double getThrustMultiplierSigma() {
+        return Math.max(0.0, finiteOrZero(cfgDouble(K_THRUST_MULT_SIGMA, D_THRUST_MULT_SIGMA)));
+    }
+
+    public void setThrustMultiplierSigma(double v) {
+        cfgPutDouble(K_THRUST_MULT_SIGMA, Math.max(0.0, finiteOrZero(v)));
+        fireChangeEvent();
+    }
+
+    /**
+     * Standard deviation of the launch mass multiplier.
+     * 0 = disabled. 0.02 = ±2% variation at 1σ. Multiplier is N(1.0, sigma).
+     */
+    public double getMassMultiplierSigma() {
+        return Math.max(0.0, finiteOrZero(cfgDouble(K_MASS_MULT_SIGMA, D_MASS_MULT_SIGMA)));
+    }
+
+    public void setMassMultiplierSigma(double v) {
+        cfgPutDouble(K_MASS_MULT_SIGMA, Math.max(0.0, finiteOrZero(v)));
+        fireChangeEvent();
+    }
+
     public int getWorkerThreads() {
         return Math.max(1, cfgInt(K_WORKER_THREADS, D_WORKER_THREADS));
     }
@@ -1082,6 +1193,66 @@ public class MonteCarloExtension extends AbstractSimulationExtension {
     public void setWorkerThreads(int v) {
         cfgPutInt(K_WORKER_THREADS, Math.max(1, v));
         fireChangeEvent();
+    }
+
+    /**
+     * Copies all user-configurable, persisted settings from another extension instance
+     * into this instance.
+     *
+     * Why: OpenRocket's default extension cloning is not guaranteed to copy the config
+     * map across versions.  The MonteCarloBatchRunner uses this to ensure batch clones
+     * inherit the exact same UI settings (including gust/shear enable flags).
+     */
+    public void copyPersistentSettingsFrom(MonteCarloExtension other) {
+        if (other == null) return;
+
+        // General
+        cfgPutBool(K_ENABLED, other.isEnabled());
+        cfgPutBool(K_DEBUG, other.isDebugEnabled());
+        cfgPutInt(K_NUM_SIMS, other.getNumberOfSimulations());
+        cfgPutBool(K_DETERMINISTIC, other.isUseDeterministicSeed());
+        cfgPutLong(K_RANDOM_SEED, other.getRandomSeed());
+
+        // Launch
+        cfgPutDouble(K_ROD_ANGLE_SIGMA_DEG, other.getLaunchRodAngleStdDevDeg());
+        cfgPutDouble(K_ROD_DIR_SIGMA_DEG, other.getLaunchRodDirectionStdDevDeg());
+        cfgPutDouble(K_LAT_SIGMA_DEG, other.getLaunchLatitudeStdDevDeg());
+        cfgPutDouble(K_LON_SIGMA_DEG, other.getLaunchLongitudeStdDevDeg());
+        cfgPutDouble(K_ALT_SIGMA_M, other.getLaunchAltitudeStdDevM());
+
+        // Atmosphere
+        cfgPutDouble(K_WIND_DIR_SIGMA_DEG, other.getWindDirectionStdDevDeg());
+        cfgPutDouble(K_TEMP_SIGMA_C, other.getTemperatureStdDevC());
+        cfgPutDouble(K_PRES_SIGMA_MBAR, other.getPressureStdDevMbar());
+
+        // Wind distributions
+        cfgPutDouble(K_WIND_AVG_SIGMA_MPS, other.getWindSpeedAverageSigmaMps());
+        cfgPutDouble(K_WIND_TURB_SIGMA_MPS, other.getWindSpeedTurbulenceSigmaMps());
+
+        // Gusts
+        cfgPutBool(K_GUST_ENABLED, other.isGustEventsEnabled());
+        cfgPutInt(K_GUST_COUNT, other.getGustEventCount());
+        cfgPutDouble(K_GUST_WINDOW_START_S, other.getGustWindowStartS());
+        cfgPutDouble(K_GUST_WINDOW_END_S, other.getGustWindowEndS());
+        cfgPutDouble(K_GUST_DURATION_MEAN_S, other.getGustDurationMeanS());
+        cfgPutDouble(K_GUST_DURATION_SIGMA_S, other.getGustDurationSigmaS());
+        cfgPutDouble(K_GUST_PEAK_MEAN_MPS, other.getGustPeakDeltaMeanMps());
+        cfgPutDouble(K_GUST_PEAK_SIGMA_MPS, other.getGustPeakDeltaSigmaMps());
+
+        // Shear
+        cfgPutBool(K_SHEAR_ENABLED, other.isShearLayerEnabled());
+        cfgPutDouble(K_SHEAR_CENTER_ALT_M, other.getShearCenterAltM());
+        cfgPutDouble(K_SHEAR_THICKNESS_M, other.getShearThicknessM());
+        cfgPutDouble(K_SHEAR_DELTA_MEAN_MPS, other.getShearDeltaMeanMps());
+        cfgPutDouble(K_SHEAR_DELTA_SIGMA_MPS, other.getShearDeltaSigmaMps());
+
+        // Vehicle / Motor physics overrides
+        cfgPutDouble(K_CD_MULT_SIGMA, other.getCdMultiplierSigma());
+        cfgPutDouble(K_THRUST_MULT_SIGMA, other.getThrustMultiplierSigma());
+        cfgPutDouble(K_MASS_MULT_SIGMA, other.getMassMultiplierSigma());
+
+        // Batch
+        cfgPutInt(K_WORKER_THREADS, other.getWorkerThreads());
     }
 
     // -------------------------------------------------------------------------

@@ -130,7 +130,14 @@ public final class MonteCarloBatchRunner {
                             // Clone extensions to isolate state
                             sim.getSimulationExtensions().clear();
                             for (SimulationExtension ext : baseSimulation.getSimulationExtensions()) {
-                                sim.getSimulationExtensions().add(ext.clone());
+                                SimulationExtension cloned = (ext != null) ? ext.clone() : null;
+                                // Ensure MC config maps survive cloning across OR versions.
+                                if (cloned instanceof MonteCarloExtension mcClone && ext instanceof MonteCarloExtension mcOrig) {
+                                    mcClone.copyPersistentSettingsFrom(mcOrig);
+                                }
+                                if (cloned != null) {
+                                    sim.getSimulationExtensions().add(cloned);
+                                }
                             }
 
                             // Configure MC extension for this run (batch context + per-run seed)
@@ -156,6 +163,11 @@ public final class MonteCarloBatchRunner {
                             double shearDeltaMeanMps = 0.0;
                             double shearDeltaSigmaMps = 0.0;
 
+                            // Physics override config (captured for CSV)
+                            double cdMultSigma = 0.0;
+                            double thrustMultSigma = 0.0;
+                            double massMultSigma = 0.0;
+
                             if (mc != null) {
                                 mc.setBatchRunContext(true);
 
@@ -177,6 +189,10 @@ public final class MonteCarloBatchRunner {
                                 shearThicknessM = mc.getShearThicknessM();
                                 shearDeltaMeanMps = mc.getShearDeltaMeanMps();
                                 shearDeltaSigmaMps = mc.getShearDeltaSigmaMps();
+
+                                cdMultSigma = mc.getCdMultiplierSigma();
+                                thrustMultSigma = mc.getThrustMultiplierSigma();
+                                massMultSigma = mc.getMassMultiplierSigma();
 
                                 if (det) {
                                     // Deterministic: baseSeed + (runIndex-1)
@@ -206,6 +222,11 @@ public final class MonteCarloBatchRunner {
                             double maxTiltDeg = Double.NaN;
                             double maxAoADeg = Double.NaN;
 
+                            // Per-run physics override values
+                            double cdMultUsed = 1.0;
+                            double thrustMultUsed = 1.0;
+                            double massMultUsed = 1.0;
+
                             if (mc != null) {
                                 GustShearMetrics m = mc.getLastGustShearMetrics();
                                 RunWindDisturbanceProfile p = mc.getLastWindDisturbanceProfile();
@@ -220,6 +241,11 @@ public final class MonteCarloBatchRunner {
                                     // Fallback: at least capture how many gusts were sampled.
                                     gustCountReal = (p.gusts != null) ? p.gusts.size() : 0;
                                 }
+
+                                // Capture realized physics override values
+                                cdMultUsed = mc.getLastCdMultiplier();
+                                thrustMultUsed = mc.getLastThrustMultiplier();
+                                massMultUsed = mc.getLastMassMultiplier();
                             }
 
                             MonteCarloRunRecord rec = new MonteCarloRunRecord(
@@ -235,6 +261,9 @@ public final class MonteCarloBatchRunner {
 
                                     gustCountReal, gustMaxDeltaWindMps, shearDeltaMps,
                                     deltaWindImpulse, maxTiltDeg, maxAoADeg,
+
+                                    cdMultSigma, thrustMultSigma, massMultSigma,
+                                    cdMultUsed, thrustMultUsed, massMultUsed,
 
                                     opts, data
                             );

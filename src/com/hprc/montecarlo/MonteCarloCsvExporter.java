@@ -150,7 +150,9 @@ public final class MonteCarloCsvExporter {
               .append("shear_delta_mean_mps,shear_delta_sigma_mps,")
               .append("gust_count_real,max_delta_wind_mps,max_delta_wind_mph,")
               .append("shear_delta_mps,shear_delta_mph,")
-              .append("delta_wind_impulse_mps_s,max_tilt_deg,max_aoa_deg,");
+              .append("delta_wind_impulse_mps_s,max_tilt_deg,max_aoa_deg,")
+              .append("cd_mult_sigma,thrust_mult_sigma,mass_mult_sigma,")
+              .append("cd_mult_used,thrust_mult_used,mass_mult_used,");
 
         for (int i = 0; i < maxWindLevels; i++) {
             int n = i + 1;
@@ -217,7 +219,13 @@ public final class MonteCarloCsvExporter {
            .append(UNIT_VELOCITY_MPH.toUnit(r.shearDeltaApplied_mps)).append(",")
            .append(r.deltaWindImpulse_mps_s).append(",")
            .append(r.maxTilt_deg).append(",")
-           .append(r.maxAoA_deg).append(",");
+           .append(r.maxAoA_deg).append(",")
+           .append(r.cdMultiplierSigma).append(",")
+           .append(r.thrustMultiplierSigma).append(",")
+           .append(r.massMultiplierSigma).append(",")
+           .append(r.cdMultiplierUsed).append(",")
+           .append(r.thrustMultiplierUsed).append(",")
+           .append(r.massMultiplierUsed).append(",");
 
         for (int i = 0; i < maxWindLevels; i++) {
             if (i < r.windLevels.size()) {
