@@ -1,8 +1,9 @@
 # OpenRocket Monte Carlo + 6DOF Landing Dispersion
 
-A plugin utilizing underlying logic from Watarloo Rocketry and TU Wien Space Team to directly employ Monte Carlo Simulations and 6DOF Landing Dispersion anyalsis. The current logic is overhauled to vary paramters that are shown below. 
+A plugin utilizing underlying logic from Watarloo Rocketry and TU Wien Space Team to directly employ Monte Carlo Simulations and 6DOF Landing Dispersion anyalsis. The current logic is overhauled to account for basic parameters up until wind gust events, shear layers, vehicle & motor performance, as well as base Cd. 
 
-![Parameters](images/Parameters.png)
+![Parameters](images/LandingPage.png)
+![Parameters](images/disturbances.png)
 
 Furthermore, the 6DOF Landing Dispersion was translated from Python to Java code to interface with current the current OpenRocket Version. It features a launch site, mean landing site, and individual landing markers along with 1, 2, and 3 sigma confidence ellipses all exported in a .kml file for Google Earth viewing. 
 
